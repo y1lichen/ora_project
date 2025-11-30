@@ -10,7 +10,7 @@ from smilp_model import solve_smilp_model
 # NUM_PATIENTS = 10     # 建議 10-20
 NUM_PATIENTS = 20
 # TRAIN_SCENARIOS = 30  # SAA 訓練場景數 (論文建議 30-100)
-TRAIN_SCENARIOS = 50
+TRAIN_SCENARIOS = 20
 TEST_SCENARIOS = 100  # 模擬測試場景數 (Out-of-sample)
 
 def extract_sequence_from_model(model, data):
