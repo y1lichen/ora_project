@@ -9,8 +9,8 @@ from instance_generator import InstanceGenerator
 import time
 
 # Import models
-from smilp_model import solve_smilp_model
-from traditional_method import solve_deterministic_model
+from smilp_model import solve_smilp_mco
+from traditional_method import solve_deterministic_model, evaluate_baseline_mean_value_model
 
 
 def extract_schedule_via_sequencing_vars(model, data):
@@ -277,62 +277,100 @@ def plot_results(wait_det, wait_smilp, log_det, log_smilp, resources, num_patien
 
 # --- 5. 主執行流程 (更新版) ---
 def run_experiment():
-    print("=== Starting Experiment ===")
+    """
+    Paper experiment framework (Section 4.2):
+    1. Solve deterministic baseline model
+    2. Solve SMILP model with MCO
+    3. Evaluate baseline model with K SAA replicates
+    4. Compute Value of Stochastic Solution (VSS)
+    5. Compare performance metrics
+    """
+    print("="*60)
+    print("SMILP Experiment: Patient Scheduling with Stochastic Durations")
+    print("="*60)
     
-    # 參數設定
+    # Parameters
     NUM_PATIENTS = 20
-    TRAIN_SCENARIOS = 30 
-    TEST_SCENARIOS = 100 
+    MCO_N0 = 5              # Initial SAA sample size
+    MCO_N_PRIME = 20        # Simulation sample size
+    MCO_K = 3               # MCO replicates
+    EVAL_K = 5              # Baseline evaluation replicates
+    EPSILON = 0.05          # AOI convergence tolerance
     
-    # 1. 生成數據
+    print(f"\nExperiment Configuration:")
+    print(f"  - Patients: {NUM_PATIENTS}")
+    print(f"  - MCO N0={MCO_N0}, N'={MCO_N_PRIME}, K={MCO_K}, ε={EPSILON}")
+    print(f"  - Baseline eval: K={EVAL_K} replicates")
+    
+    # 1. Generate data
+    print(f"\n[1/4] Generating instance...")
     gen = InstanceGenerator(num_patients=NUM_PATIENTS)
-    train_data = gen.generate_data(num_scenarios=TRAIN_SCENARIOS)
+    train_data = gen.generate_data(num_scenarios=MCO_N_PRIME)
+    print(f"      Generated {len(train_data['activities'])} activities across {NUM_PATIENTS} patients")
     
-    # 2. 求解模型
-    print("\n[Traditional] Solving Deterministic Model...")
-    m_det = solve_deterministic_model(train_data, time_limit=60)
-    sched_det = extract_schedule_via_sequencing_vars(m_det, train_data)
+    # 2. Solve deterministic baseline model
+    print(f"\n[2/4] Solving Deterministic Baseline Model...")
+    m_baseline = solve_deterministic_model(train_data, time_limit=60)
+    if m_baseline.Status not in [GRB.OPTIMAL, GRB.SUBOPTIMAL, GRB.TIME_LIMIT]:
+        print("      ERROR: Baseline model failed to solve.")
+        return
+    print(f"      ✓ Baseline deterministic objective: {m_baseline.ObjVal:.4f}")
     
-    print("\n[SMILP] Solving Stochastic Model...")
-    m_smilp = solve_smilp_model(train_data, time_limit=300, gap=0.05)
-    sched_smilp = extract_schedule_via_sequencing_vars(m_smilp, train_data)
+    # 3. Solve SMILP model with MCO
+    print(f"\n[3/4] Solving SMILP Model with MCO Algorithm...")
+    smilp_result = solve_smilp_mco(
+        train_data,
+        N0=MCO_N0,
+        N_prime=MCO_N_PRIME,
+        K=MCO_K,
+        epsilon=EPSILON,
+        time_limit=300,
+        gap=0.05
+    )
+    print(f"      ✓ SMILP optimal sample size: N={smilp_result.optimal_sample_size}")
+    print(f"      ✓ SMILP lower bound (v̄_N): {smilp_result.lower_bound:.4f}")
+    print(f"      ✓ SMILP upper bound (v̄_N'): {smilp_result.upper_bound:.4f}")
+    print(f"      ✓ AOI convergence history: {[f'{x:.6f}' for x in smilp_result.aoi_history]}")
     
-    # 3. 模擬與收集資料
-    print(f"\n[Simulation] Running {TEST_SCENARIOS} tests...")
-    wait_det, wait_smilp = [], []
-    last_log_det, last_log_smilp = None, None
+    # 4. Evaluate baseline with K SAA replicates (paper evaluation procedure)
+    print(f"\n[4/4] Evaluating Baseline Mean Value Model (K={EVAL_K} replicates)...")
+    baseline_avg_obj, baseline_objectives = evaluate_baseline_mean_value_model(
+        m_baseline,
+        train_data,
+        K=EVAL_K,
+        time_limit=300,
+        gap=0.05
+    )
     
-    np.random.seed(999)
-    for i in range(TEST_SCENARIOS):
-        seed = i * 1000
-        is_last = (i == TEST_SCENARIOS - 1)
-        
-        if is_last:
-            w_d, log_d = simulate_realization(sched_det, train_data, random_seed=seed, return_log=True)
-            w_s, log_s = simulate_realization(sched_smilp, train_data, random_seed=seed, return_log=True)
-            last_log_det = log_d
-            last_log_smilp = log_s
-        else:
-            w_d = simulate_realization(sched_det, train_data, random_seed=seed)
-            w_s = simulate_realization(sched_smilp, train_data, random_seed=seed)
-            
-        wait_det.append(w_d)
-        wait_smilp.append(w_s)
-        
-    # 4. 輸出與繪圖
-    avg_d = np.mean(wait_det)
-    avg_s = np.mean(wait_smilp)
-    improv = (avg_d - avg_s) / avg_d * 100
+    # 5. Compute Value of Stochastic Solution (VSS)
+    print(f"\n" + "="*60)
+    print("FINAL RESULTS & VSS COMPUTATION")
+    print("="*60)
     
-    print("\n" + "="*40)
-    print("FINAL RESULTS")
-    print(f"Traditional: {avg_d:.2f} min")
-    print(f"SMILP:       {avg_s:.2f} min")
-    print(f"Improvement: {improv:.2f}%")
-    print("="*40)
+    v_smilp = smilp_result.upper_bound  # v̄_N'
+    v_baseline = baseline_avg_obj        # v̄base_N'
+    vss = v_baseline - v_smilp           # VSS = v̄base_N' - v̄_N'
+    vss_percent = (vss / v_baseline * 100) if v_baseline != 0 else 0
     
-    print("Generating plots...")
-    plot_results(wait_det, wait_smilp, last_log_det, last_log_smilp, train_data['resources'], NUM_PATIENTS)
+    print(f"\nValue of Stochastic Solution (VSS):")
+    print(f"  SMILP solution (v̄_N'):          {v_smilp:.4f} min")
+    print(f"  Baseline mean value (v̄base_N'): {v_baseline:.4f} min")
+    print(f"  VSS = v̄base_N' - v̄_N':         {vss:.4f} min")
+    print(f"  VSS percentage:                   {vss_percent:.2f}%")
+    
+    if vss > 0:
+        print(f"\n  ✓ Stochastic solution is {vss_percent:.2f}% BETTER than deterministic baseline")
+        print(f"    This demonstrates the value of modeling activity duration uncertainty.")
+    else:
+        print(f"\n  Note: Baseline mean value solution achieved better objective value.")
+        print(f"    This can occur due to SAA approximation gaps.")
+    
+    print(f"\nSMILP Solution Quality:")
+    print(f"  Approximation gap: {smilp_result.aoi_history[-1] if smilp_result.aoi_history else 'N/A':.6f}")
+    print(f"  Scenario samples used: {smilp_result.optimal_sample_size}")
+    print(f"  Validation samples: {MCO_N_PRIME}")
+    
+    print(f"\n" + "="*60)
 
 if __name__ == "__main__":
     run_experiment()
