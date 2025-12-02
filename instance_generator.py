@@ -6,71 +6,148 @@ class InstanceGenerator:
     def __init__(self, num_patients=20, arrival_interval=10, random_seed=42):
         np.random.seed(random_seed)
         random.seed(random_seed)
+
         self.num_patients = num_patients
         self.arrival_interval = arrival_interval
-        
+
+        # ---------------------------------------------------------
+        # 1. Resource definitions (可多資源)
+        # ---------------------------------------------------------
         self.resources = {
-            'Intake':        {'capacity': 100, 'id': 0}, 
-            'Radiology Tech':{'capacity': 1,   'id': 1}, 
-            'Provider':      {'capacity': 2,   'id': 2}, 
-            'Ortho Tech':    {'capacity': 1,   'id': 3}, 
-            'Discharge':     {'capacity': 100, 'id': 4}
+            "Intake Nurse":     {"capacity": 100, "id": 0},
+            "Radiology Tech":   {"capacity": 1,   "id": 1},
+            "XRay Room":        {"capacity": 1,   "id": 2},
+            "Provider":         {"capacity": 2,   "id": 3},
+            "Ortho Tech":       {"capacity": 1,   "id": 4},
+            "Casting Room":     {"capacity": 1,   "id": 5},
+            "Discharge Nurse":  {"capacity": 100, "id": 6},
         }
-        
+
+        # ---------------------------------------------------------
+        # 2. Activity → multi-resource mapping
+        # ---------------------------------------------------------
+        self.activity_resource_map = {
+            "Intake":               ["Intake Nurse"],
+            "Radiology":            ["Radiology Tech", "XRay Room"],
+            "Provider Visit":       ["Provider"],
+            "Casting Procedure":    ["Ortho Tech", "Casting Room"],
+            "Discharge":            ["Discharge Nurse"],
+        }
+
+        # ---------------------------------------------------------
+        # 3. RTLS-based dominant pathways
+        # ---------------------------------------------------------
         self.pathway_data = [
-            {'prob': 0.3803, 'sequence': ['Intake', 'Radiology Tech', 'Provider', 'Ortho Tech', 'Discharge'], 'means': [4.7, 3.48, 4.52, 11.62, 3.43], 'variances':[3.25, 4.85, 13.9, 185.52, 2.63]},
-            {'prob': 0.2455, 'sequence': ['Intake', 'Provider', 'Ortho Tech', 'Discharge'], 'means': [4.93, 4.99, 12.47, 3.69], 'variances':[4.0, 20.11, 206.96, 2.92]},
-            {'prob': 0.1393, 'sequence': ['Intake', 'Ortho Tech', 'Discharge'], 'means': [4.75, 11.82, 3.44], 'variances':[4.35, 232.7, 3.36]},
-            {'prob': 0.1378, 'sequence': ['Intake', 'Radiology Tech', 'Ortho Tech', 'Discharge'], 'means': [4.91, 3.58, 11.25, 3.49], 'variances':[3.75, 5.79, 224.31, 3.31]},
-            {'prob': 0.0971, 'sequence': ['Intake', 'Radiology Tech', 'Provider', 'Discharge'], 'means': [5.06, 3.52, 6.15, 3.62], 'variances':[3.98, 4.95, 30.61, 4.06]}
+            {
+                "prob": 0.3803,
+                "sequence": ["Intake", "Radiology", "Provider Visit", "Casting Procedure", "Discharge"],
+                "means":     [4.7, 3.48, 4.52, 11.62, 3.43],
+                "variances": [3.25, 4.85, 13.9, 185.52, 2.63],
+            },
+            {
+                "prob": 0.2455,
+                "sequence": ["Intake", "Provider Visit", "Casting Procedure", "Discharge"],
+                "means":     [4.93, 4.99, 12.47, 3.69],
+                "variances": [4.0, 20.11, 206.96, 2.92],
+            },
+            {
+                "prob": 0.1393,
+                "sequence": ["Intake", "Casting Procedure", "Discharge"],
+                "means":     [4.75, 11.82, 3.44],
+                "variances": [4.35, 232.7, 3.36],
+            },
+            {
+                "prob": 0.1378,
+                "sequence": ["Intake", "Radiology", "Casting Procedure", "Discharge"],
+                "means":     [4.91, 3.58, 11.25, 3.49],
+                "variances": [3.75, 5.79, 224.31, 3.31],
+            },
+            {
+                "prob": 0.0971,
+                "sequence": ["Intake", "Radiology", "Provider Visit", "Discharge"],
+                "means":     [5.06, 3.52, 6.15, 3.62],
+                "variances": [3.98, 4.95, 30.61, 4.06],
+            },
         ]
 
     def _convert_params_to_lognormal(self, mean, var):
-        sigma2 = np.log(1 + var / (mean**2))
+        sigma2 = np.log(1 + var / (mean ** 2))
         sigma = np.sqrt(sigma2)
         mu = np.log(mean) - 0.5 * sigma2
         return mu, sigma
 
-    def generate_data(self, num_scenarios=1):
-        patients, activities = [], []
-        current_arrival_time = 0
+    def generate_data(self, num_scenarios=30):
+        patients = []
+        activities = []
+
+        current_arrival = 0
         activity_global_id = 0
-        path_probs = np.array([p['prob'] for p in self.pathway_data])
-        path_probs /= np.sum(path_probs)
-        
-        for p_id in range(self.num_patients):
+
+        path_probs = np.array([p["prob"] for p in self.pathway_data])
+        path_probs /= path_probs.sum()
+
+        for pid in range(self.num_patients):
+
+            # ------------- Pathway selection -------------
             path_idx = np.random.choice(len(self.pathway_data), p=path_probs)
-            path_info = self.pathway_data[path_idx]
-            sequence, means, variances = path_info['sequence'], path_info['means'], path_info['variances']
-            
-            patient_activities = []
-            interval = max(1, np.random.normal(self.arrival_interval, 1.0)) 
-            current_arrival_time += int(round(interval))
-            previous_act_id = None
-            
-            for step_idx, res_name in enumerate(sequence):
+            pinfo = self.pathway_data[path_idx]
+
+            seq = pinfo["sequence"]
+            means = pinfo["means"]
+            vars = pinfo["variances"]
+
+            patient_act_ids = []
+
+            # ----- arrival -----
+            interval = max(1, np.random.normal(self.arrival_interval, 1.0))
+            current_arrival += int(round(interval))
+
+            predecessor = None
+
+            # ---------------- Generate activities ----------------
+            for i, act_name in enumerate(seq):
+
+                required_res = [
+                    self.resources[r]["id"] for r in self.activity_resource_map[act_name]
+                ]
+
+                mean_d = means[i]
+                var_d = vars[i]
+
+                mu, sigma = self._convert_params_to_lognormal(mean_d, var_d)
+
+                samples = np.maximum(
+                    1, np.round(np.random.lognormal(mu, sigma, num_scenarios))
+                )
+
                 act_id = activity_global_id
                 activity_global_id += 1
-                arithmetic_mean = means[step_idx]
-                arithmetic_var = variances[step_idx]
-                mu, sigma = self._convert_params_to_lognormal(arithmetic_mean, arithmetic_var)
-                
-                durations = np.maximum(1, np.round(np.random.lognormal(mu, sigma, num_scenarios)))
-                
+                patient_act_ids.append(act_id)
+
                 activities.append({
-                    'id': act_id,
-                    'patient_id': p_id,
-                    'resource_type': self.resources[res_name]['id'],
-                    'resource_name': res_name,
-                    'durations': durations.tolist(),
-                    'mean_duration': arithmetic_mean,
-                    'is_start': (step_idx == 0),
-                    'scheduled_start': current_arrival_time if step_idx == 0 else 0,
-                    'predecessor': previous_act_id
+                    "id": act_id,
+                    "patient_id": pid,
+                    "name": act_name,
+                    "required_resources": required_res,
+                    "durations": samples.tolist(),
+                    "mean_duration": mean_d,
+                    "predecessor": predecessor,
+                    "is_start": i == 0,
+                    "scheduled_start": current_arrival if i == 0 else None
                 })
-                patient_activities.append(act_id)
-                previous_act_id = act_id
-            
-            patients.append({'id': p_id, 'pathway_type': path_idx, 'activity_ids': patient_activities, 'arrival_time': current_arrival_time})
-            
-        return {'patients': patients, 'activities': activities, 'resources': self.resources, 'num_scenarios': num_scenarios}
+
+                predecessor = act_id
+
+            patients.append({
+                "id": pid,
+                "pathway_type": path_idx,
+                "activity_ids": patient_act_ids,
+                "arrival_time": current_arrival
+            })
+
+        return {
+            "patients": patients,
+            "activities": activities,
+            "resources": self.resources,
+            "num_scenarios": num_scenarios,
+        }
