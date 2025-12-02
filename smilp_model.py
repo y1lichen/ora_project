@@ -4,13 +4,10 @@ import numpy as np
 import random
 
 def solve_smilp_mco(data, num_saa_samples=10, num_mco_trials=5,
-                    time_limit=300, gap=0.05, bigM=10000, random_seed=42):
+                     time_limit=300, gap=0.05, bigM=10000, random_seed=42):
     """
-    SMILP + SAA + MCO
-    - num_saa_samples: 每組 SAA sample 數量
-    - num_mco_trials: 生成幾組 SAA samples，挑選最佳 assignment
+    SMILP + SAA + MCO with q variables for capacity constraints
     """
-
     np.random.seed(random_seed)
     random.seed(random_seed)
 
@@ -22,12 +19,13 @@ def solve_smilp_mco(data, num_saa_samples=10, num_mco_trials=5,
     resource_instances = {}
     inst_to_type = {}
     global_inst_id = 0
+    resource_capacity = {}
     for r_name, r_info in resources.items():
         type_id = r_info['id']
         cap = r_info['capacity']
-        real_cap = cap if cap < 10 else 1
         resource_instances[type_id] = []
-        for k in range(real_cap):
+        resource_capacity[type_id] = cap  # 保存容量 k_j
+        for k in range(cap):
             resource_instances[type_id].append(global_inst_id)
             inst_to_type[global_inst_id] = type_id
             global_inst_id += 1
@@ -60,11 +58,11 @@ def solve_smilp_mco(data, num_saa_samples=10, num_mco_trials=5,
                 log_sigma = np.sqrt(np.log(phi**2 / mu_val**2))
                 dur = np.random.lognormal(log_mu, log_sigma)
                 realized_durations[k][a_id] = max(1, round(dur))
-                b[(a_id, k)] = None  # 先 placeholder
+                b[(a_id, k)] = None  # placeholder
 
         # 建立模型
         m = gp.Model(f"SMILP_MCO_trial_{trial}")
-        x, s1, s2 = {}, {}, {}
+        x, s1, s2, q = {}, {}, {}, {}
         conflict_pairs = []
 
         act_types = [set(Va_g[a['id']].keys()) for a in activities]
@@ -84,18 +82,32 @@ def solve_smilp_mco(data, num_saa_samples=10, num_mco_trials=5,
                 m.addConstr(gp.quicksum(x[(a_id, inst)] for inst in insts) == req_cnt,
                             name=f"assign_cnt_a{a_id}_g{g}")
 
-        # 排序變數
-        for (i, j, shared) in conflict_pairs:
-            s1[(i, j)] = m.addVar(vtype=GRB.BINARY, name=f"s1_{i}_{j}")
-            s2[(i, j)] = m.addVar(vtype=GRB.BINARY, name=f"s2_{i}_{j}")
-            m.addConstr(s1[(i, j)] + s2[(i, j)] <= 1)
-            for g in shared:
-                insts = resource_instances.get(g, [])
-                for inst in insts:
-                    xi = x.get((i, inst), None)
-                    xj = x.get((j, inst), None)
-                    if xi is not None and xj is not None:
-                        m.addConstr(s1[(i, j)] + s2[(i, j)] >= xi + xj - 1)
+        # q 變數 + 排序變數
+        for g, insts in resource_instances.items():
+            acts_with_g = [a['id'] for a in activities if g in Va_g[a['id']]]
+            for i_idx in range(len(acts_with_g)):
+                for j_idx in range(i_idx + 1, len(acts_with_g)):
+                    a, a_prime = acts_with_g[i_idx], acts_with_g[j_idx]
+                    for inst in insts:
+                        # q_j[a,a'] 對應論文 1c
+                        q[(g, inst, a, a_prime)] = m.addVar(vtype=GRB.BINARY, name=f"q_{g}_{inst}_{a}_{a_prime}")
+                        # s1, s2 對應論文排序變數
+                        key = (a, a_prime)
+                        if key not in s1:
+                            s1[key] = m.addVar(vtype=GRB.BINARY, name=f"s1_{a}_{a_prime}")
+                            s2[key] = m.addVar(vtype=GRB.BINARY, name=f"s2_{a}_{a_prime}")
+                            m.addConstr(s1[key] + s2[key] <= 1)
+                        # 1c 對應約束
+                        m.addConstr(q[(g, inst, a, a_prime)] >= s1[key] + s2[key] + x[(a, inst)] + x[(a_prime, inst)] - 3)
+
+        # 第一階段容量限制 1d
+        for g, insts in resource_instances.items():
+            k_j = resource_capacity[g]
+            for inst in insts:
+                acts_with_g = [a['id'] for a in activities if g in Va_g[a['id']]]
+                for a in acts_with_g:
+                    m.addConstr(gp.quicksum(q[(g, inst, a, a_prime)]
+                                             for a_prime in acts_with_g if a_prime != a) <= k_j - 1)
 
         # 第二階段開始時間
         for k in range(num_saa_samples):
