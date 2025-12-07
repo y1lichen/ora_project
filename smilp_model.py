@@ -1,251 +1,188 @@
 import gurobipy as gp
 from gurobipy import GRB
 import numpy as np
-import random
 
-def solve_smilp_mco(data, N0=5, N_prime=20, K=3, epsilon=0.05,
-                         time_limit=300, gap=0.05, bigM=10000, random_seed=42):
-    """
-    Implements SMILP + SAA + MCO.
-    Returns the result object containing the model, solution, bounds, AND the validation scenarios used.
-    """
-    np.random.seed(random_seed)
-    random.seed(random_seed)
+class SMILPSolver:
+    def __init__(self, data, time_limit=3600, mip_gap=0.05, baseline_sol=None):
+        """
+        :param data: 來自 InstanceGenerator 的輸出字典
+        :param time_limit: Gurobi 時間限制 (秒)
+        :param mip_gap: 收斂 Gap
+        """
+        self.data = data
+        self.patients = data['patients']
+        self.activities = data['activities']
+        self.resources = data['resources']
+        self.num_scenarios = data['num_scenarios']
+        self.time_limit = time_limit
+        self.mip_gap = mip_gap
+        self.baseline_sol = baseline_sol
+        
+        # 為了建立約束，我們需要知道每個 Activity 潛在可用的資源集合 J_g
+        # 在你的 generator 中，這已經被解析為具體的 ID 列表
+        self.act_valid_resources = {act['id']: act['required_resources'] for act in self.activities}
+        
+        # Big-M (足夠大的數，約為總 horizon 長度)
+        self.M = 10000 
 
-    activities = data['activities']
-    resources = data['resources']
-    num_acts = len(activities)
+        self.model = gp.Model("PatientScheduling_SMILP")
+        self.model.setParam('TimeLimit', self.time_limit)
+        self.model.setParam('MIPGap', self.mip_gap)
+        self.model.setParam('OutputFlag', 1) # 設為 1 可看到求解過程
 
-    # 1. Resource Setup
-    resource_instances = {}
-    resource_capacities = {}
-    global_inst_id = 0
-    
-    for r_name, r_info in resources.items():
-        type_id = r_info['id']
-        cap = r_info['capacity']
-        resource_instances[type_id] = []
-        resource_capacities[type_id] = cap
-        for k in range(cap):
-            resource_instances[type_id].append(global_inst_id)
-            global_inst_id += 1
+    def build_and_solve(self):
+        m = self.model
+        acts = self.activities
+        scenarios = range(self.num_scenarios)
+        
+        # ==========================
+        # Stage 1 Variables (Scenario Independent)
+        # ==========================
+        
+        # x[a, j]: Binary, 1 if activity a is served by resource j
+        x = {}
+        for a in acts:
+            for j in self.act_valid_resources[a['id']]:
+                x[a['id'], j] = m.addVar(vtype=GRB.BINARY, name=f"x_{a['id']}_{j}")
 
-    Va_g = [{} for _ in range(num_acts)]
-    for a in activities:
-        a_id = a['id']
-        for g in a['required_resources']:
-            Va_g[a_id][g] = Va_g[a_id].get(g, 0) + 1
+        # 找出需要排序的 Activity Pairs (a, a')
+        # 論文定義: a 和 a' 共享至少一種類型的資源 (這裡是共享具體資源ID)
+        competition_pairs = []
+        for i, a1 in enumerate(acts):
+            for j, a2 in enumerate(acts):
+                if i == j: continue
+                # 檢查資源需求是否有交集
+                res1 = set(self.act_valid_resources[a1['id']])
+                res2 = set(self.act_valid_resources[a2['id']])
+                if not res1.isdisjoint(res2):
+                    competition_pairs.append((a1['id'], a2['id']))
 
-    # Helper: Generate duration samples
-    def generate_duration_samples(num_samples):
-        durations = {}
-        for k in range(num_samples):
-            durations[k] = {}
-            for a in activities:
-                a_id = a['id']
-                mu_val = a['mean_duration']
-                sigma_val = mu_val * 0.3
-                phi = np.sqrt(sigma_val**2 + mu_val**2)
-                log_mu = np.log(mu_val**2 / phi)
-                log_sigma = np.sqrt(np.log(phi**2 / mu_val**2))
-                dur = np.random.lognormal(log_mu, log_sigma)
-                durations[k][a_id] = max(1, round(dur))
-        return durations
+        # s1[a, a']: 1 if a is assigned NO LATER THAN a' (Sequence order)
+        s1 = m.addVars(competition_pairs, vtype=GRB.BINARY, name="s1")
+        
+        # s2[a, a']: 1 if a is assigned before a' ends (Overlapping logic)
+        s2 = m.addVars(competition_pairs, vtype=GRB.BINARY, name="s2")
 
-    # Helper: Build Model
-    def build_saa_model(durations_dict, num_scenarios, trial_id):
-        m = gp.Model(f"SMILP_SAA_{trial_id}")
-        x, s1, s2, q = {}, {}, {}, {}
-        b = {}
+        # q[j, a, a']: 1 if a' is ongoing when a starts on resource j
+        # 只針對共享資源 j 的 pair 建立 q
+        q_indices = []
+        for (a_id, a_prime_id) in competition_pairs:
+            common_res = set(self.act_valid_resources[a_id]) & set(self.act_valid_resources[a_prime_id])
+            for r_id in common_res:
+                q_indices.append((r_id, a_id, a_prime_id))
+        
+        q = m.addVars(q_indices, vtype=GRB.BINARY, name="q")
 
-        # First Stage
-        for a in activities:
+        # ==========================
+        # Stage 2 Variables (Scenario Dependent)
+        # ==========================
+        
+        # b[a, n]: Start time of activity a in scenario n
+        b = m.addVars([a['id'] for a in acts], scenarios, vtype=GRB.CONTINUOUS, lb=0, name="b")
+
+        m.update()
+
+        # ==========================
+        # Constraints
+        # ==========================
+
+        # --- (1b) Resource Assignment ---
+        for a in acts:
+            m.addConstr(gp.quicksum(x[a['id'], j] for j in self.act_valid_resources[a['id']]) == 1, 
+                        name=f"assign_{a['id']}")
+
+        # --- (1c) q Logic Definition ---
+        # q >= s1 + s2 + x_a + x_a' - 3
+        for (r_id, a_id, a_prime_id) in q_indices:
+            m.addConstr(q[r_id, a_id, a_prime_id] >= 
+                        s1[a_id, a_prime_id] + s2[a_id, a_prime_id] + 
+                        x[a_id, r_id] + x[a_prime_id, r_id] - 3,
+                        name=f"q_def_{r_id}_{a_id}_{a_prime_id}")
+
+        # --- (1d) Resource Capacity ---
+        # Sum of q[j, a, a'] <= Capacity - 1
+        # Generator 中的 capacity 都是 1，所以 sum(q) <= 0 (即不能重疊)
+        for a in acts:
             a_id = a['id']
-            for g, req_cnt in Va_g[a_id].items():
-                insts = resource_instances.get(g, [])
-                for inst in insts:
-                    x[(a_id, inst)] = m.addVar(vtype=GRB.BINARY, name=f"x_{a_id}_{inst}")
-                m.addConstr(gp.quicksum(x[(a_id, inst)] for inst in insts) == req_cnt)
-
-        conflict_pairs = []
-        act_types = [set(Va_g[a['id']].keys()) for a in activities]
-        for i in range(num_acts):
-            for j in range(i + 1, num_acts):
-                shared = act_types[i].intersection(act_types[j])
-                if shared:
-                    conflict_pairs.append((i, j, shared))
-
-        for g, insts in resource_instances.items():
-            acts_with_g = [a['id'] for a in activities if g in Va_g[a['id']]]
-            k_j = resource_capacities[g]
-            for inst in insts:
-                for i_idx in range(len(acts_with_g)):
-                    for j_idx in range(i_idx + 1, len(acts_with_g)):
-                        a, a_prime = acts_with_g[i_idx], acts_with_g[j_idx]
-                        key = (a, a_prime)
-                        if key not in s1:
-                            s1[key] = m.addVar(vtype=GRB.BINARY, name=f"s1_{a}_{a_prime}")
-                            s2[key] = m.addVar(vtype=GRB.BINARY, name=f"s2_{a}_{a_prime}")
-                            m.addConstr(s1[key] + s2[key] <= 1)
-                        q[(g, inst, a, a_prime)] = m.addVar(vtype=GRB.BINARY)
-                        m.addConstr(q[(g, inst, a, a_prime)] >= s1[key] + s2[key] + x[(a, inst)] + x[(a_prime, inst)] - 3)
-        
-        for g, insts in resource_instances.items():
-            acts_with_g = [a['id'] for a in activities if g in Va_g[a['id']]]
-            k_j = resource_capacities[g]
-            for inst in insts:
-                for a in acts_with_g:
-                    q_sum = gp.LinExpr()
-                    for a_prime in acts_with_g:
-                        if a_prime == a: continue
-                        key_pair = (min(a, a_prime), max(a, a_prime))
-                        if (g, inst, key_pair[0], key_pair[1]) in q:
-                            q_sum += q[(g, inst, key_pair[0], key_pair[1])]
-                    m.addConstr(q_sum <= k_j - 1)
-
-        # Second Stage
-        for scenario_n in range(num_scenarios):
-            durations = durations_dict[scenario_n]
-            for a in activities:
-                b[(a['id'], scenario_n)] = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name=f"b_{a['id']}_{scenario_n}")
-            
-            for a in activities:
-                a_id = a['id']
-                if a['is_start']:
-                    m.addConstr(b[(a_id, scenario_n)] >= a['scheduled_start'])
-                else:
-                    prev_id = a['predecessor']
-                    prev_dur = durations[prev_id]
-                    m.addConstr(b[(a_id, scenario_n)] >= b[(prev_id, scenario_n)] + prev_dur)
-            
-            for (a, a_prime, shared_res) in conflict_pairs:
-                dur_a = durations[a]
-                dur_a_prime = durations[a_prime]
-                m.addConstr(bigM * s1[(a, a_prime)] >= b[(a, scenario_n)] - b[(a_prime, scenario_n)] + 1)
-                m.addConstr(bigM * (1 - s1[(a, a_prime)]) >= b[(a_prime, scenario_n)] - b[(a, scenario_n)])
-                m.addConstr(bigM * s2[(a, a_prime)] >= b[(a_prime, scenario_n)] - b[(a, scenario_n)] + dur_a_prime)
-                m.addConstr(bigM * (1 - s2[(a, a_prime)]) >= b[(a, scenario_n)] - b[(a_prime, scenario_n)] - dur_a_prime + 1)
-
-        total_wait = gp.LinExpr()
-        for scenario_n in range(num_scenarios):
-            durations = durations_dict[scenario_n]
-            for a in activities:
-                a_id = a['id']
-                if a['is_start']:
-                    total_wait += b[(a_id, scenario_n)] - a['scheduled_start']
-                else:
-                    prev_id = a['predecessor']
-                    prev_dur = durations[prev_id]
-                    total_wait += b[(a_id, scenario_n)] - (b[(prev_id, scenario_n)] + prev_dur)
-        
-        m.setObjective(total_wait / num_scenarios, GRB.MINIMIZE)
-        return m, x, s1, s2, q, b
-
-    # ========== MCO ALGORITHM ==========
-    print(f"\n[MCO] Starting: N0={N0}, N'={N_prime}, K={K}, ε={epsilon}")
-    N = N0
-    aoi_history = []
-    
-    # Store the validation scenarios from the best iteration to pass to Baseline
-    final_validation_scenarios = None 
-    final_v_N_bar = 0
-    final_v_Np_bar = 0
-    optimal_N = N
-
-    for mco_iter in range(10):
-        print(f"[MCO Iter {mco_iter+1}] N={N}")
-        v_N_reps = []
-        v_Np_reps = []
-        
-        # We need to temporarily store validation scenarios for this iteration
-        # In case this iteration converges, we use its LAST replicate's scenarios (or average them? 
-        # Typically we just need A set of scenarios. Let's store the last replicate's set for simplicity)
-        last_replicate_scenarios = None
-
-        for k in range(K):
-            all_durations = generate_duration_samples(N + N_prime)
-            opt_durations = {i: all_durations[i] for i in range(N)}
-            sim_durations = {i: all_durations[N+i] for i in range(N_prime)}
-            
-            # Optimization
-            m_opt, x_opt, s1_opt, _, _, _ = build_saa_model(opt_durations, N, f"opt_{mco_iter}_{k}")
-            m_opt.setParam('OutputFlag', 0)
-            m_opt.setParam('TimeLimit', time_limit)
-            m_opt.setParam('MIPGap', gap)
-            m_opt.optimize()
-            
-            if m_opt.Status not in [GRB.OPTIMAL, GRB.SUBOPTIMAL, GRB.TIME_LIMIT]: continue
-            v_N_reps.append(m_opt.ObjVal)
-            
-            # Extract Solution
-            x_sol = {}
-            for (aid, inst), v in x_opt.items():
-                if v.X > 0.5: x_sol.setdefault(aid, []).append(inst)
-            s1_sol = {key: True for key, v in s1_opt.items() if v.X > 0.5}
-
-            # Validation
-            m_sim, x_sim, s1_sim, _, _, _ = build_saa_model(sim_durations, N_prime, f"sim_{mco_iter}_{k}")
-            for (aid, inst), v in x_sim.items():
-                m_sim.addConstr(v == (1 if aid in x_sol and inst in x_sol[aid] else 0))
-            for key, v in s1_sim.items():
-                m_sim.addConstr(v == (1 if key in s1_sol else 0))
+            for r_id in self.act_valid_resources[a_id]:
+                # 找出所有與 a 在資源 r 上競爭的 a'
+                competitors = [pair[1] for pair in competition_pairs if pair[0] == a_id and r_id in self.act_valid_resources[pair[1]]]
                 
-            m_sim.setParam('OutputFlag', 0)
-            m_sim.setParam('TimeLimit', time_limit)
-            m_sim.setParam('MIPGap', gap)
-            m_sim.optimize()
+                # 假設 capacity 固定為 1 (依據 generator)
+                cap = 1
+                if competitors:
+                    # 使用 Big-M 放寬：如果 x[a,r]=0 (a沒用這個資源)，則約束無效
+                    m.addConstr(gp.quicksum(q[r_id, a_id, a_prime] for a_prime in competitors) <= 
+                                cap - 1 + self.M * (1 - x[a_id, r_id]),
+                                name=f"capacity_{r_id}_{a_id}")
+
+        # --- Stage 2: Scenario Specific Constraints ---
+        total_wait_expr = 0
+
+        for n in scenarios:
+            for a in acts:
+                a_id = a['id']
+                
+                # (2b) Initial Activity Start Time
+                if a['is_start']:
+                    scheduled_t = a['scheduled_start']
+                    m.addConstr(b[a_id, n] >= scheduled_t, name=f"start_init_{a_id}_{n}")
+                    total_wait_expr += (b[a_id, n] - scheduled_t)
+                
+                # (2c) Precedence Constraints (同個病人的流程)
+                else:
+                    pred_id = a['predecessor']
+                    pred_act = next(item for item in acts if item["id"] == pred_id)
+                    pred_dur = pred_act['durations'][n] # Realized duration
+                    
+                    m.addConstr(b[a_id, n] >= b[pred_id, n] + pred_dur, name=f"prec_{a_id}_{n}")
+                    total_wait_expr += (b[a_id, n] - b[pred_id, n] - pred_dur)
+
+            # (2d) - (2g) Sequencing Constraints (linking s1, s2 with b)
+            for (a_id, a_prime_id) in competition_pairs:
+                a_prime_act = next(item for item in acts if item["id"] == a_prime_id)
+                d_prime_n = a_prime_act['durations'][n]
+
+                # (2d) M * s1 >= b_a - b_a' + 1
+                m.addConstr(self.M * s1[a_id, a_prime_id] >= b[a_id, n] - b[a_prime_id, n] + 0.001)
+                
+                # (2e) M(1 - s1) >= b_a' - b_a
+                m.addConstr(self.M * (1 - s1[a_id, a_prime_id]) >= b[a_prime_id, n] - b[a_id, n])
+
+                # (2f) M * s2 >= b_a' - b_a + d_a'
+                m.addConstr(self.M * s2[a_id, a_prime_id] >= b[a_prime_id, n] - b[a_id, n] + d_prime_n)
+
+                # (2g) M(1 - s2) >= b_a - b_a' - d_a' + 1
+                m.addConstr(self.M * (1 - s2[a_id, a_prime_id]) >= b[a_id, n] - b[a_prime_id, n] - d_prime_n + 0.001)
+
+        # ==========================
+        # Objective (3a)
+        # ==========================
+        # Minimize Expected Total Waiting Time (Sample Average)
+        m.setObjective((1.0 / self.num_scenarios) * total_wait_expr, GRB.MINIMIZE)
+        # m.setParam('MIPFocus', 1)  # 1 代表專注於尋找可行解 (Feasible Solutions)
+        if self.baseline_sol:
+            for k, v in self.baseline_sol['x'].items():
+                if k in x: x[k].Start = v
+            for k, v in self.baseline_sol['s1'].items():
+                if k in s1: s1[k].Start = v
+            for k, v in self.baseline_sol['s2'].items():
+                if k in s2: s2[k].Start = v
+        m.optimize()
+
+        if m.status == GRB.OPTIMAL or m.status == GRB.TIME_LIMIT:
+            # 提取第一階段決策 (Planning Decisions)
+            sol_x = {(k[0], k[1]): v.X for k, v in x.items()}
+            sol_s1 = {k: v.X for k, v in s1.items()}
+            sol_s2 = {k: v.X for k, v in s2.items()}
             
-            if m_sim.Status in [GRB.OPTIMAL, GRB.SUBOPTIMAL, GRB.TIME_LIMIT]:
-                v_Np_reps.append(m_sim.ObjVal)
-                last_replicate_scenarios = sim_durations # Store this set
-
-        if not v_N_reps or not v_Np_reps:
-            N += N0
-            continue
-
-        v_N_bar = np.mean(v_N_reps)
-        v_Np_bar = np.mean(v_Np_reps)
-        aoi = abs(v_Np_bar - v_N_bar) / v_Np_bar if v_Np_bar != 0 else 0
-        aoi_history.append(aoi)
-        
-        print(f"  AOI: {aoi:.6f} (LB:{v_N_bar:.2f}, UB:{v_Np_bar:.2f})")
-
-        if aoi <= epsilon:
-            print(f"  Converged! Optimal N={N}")
-            optimal_N = N
-            final_v_N_bar = v_N_bar
-            final_v_Np_bar = v_Np_bar
-            # Capture the validation scenarios from the simulation stage
-            # IMPORTANT: The scenarios used to calculate v_Np_bar are aggregated.
-            # To be strictly fair, we should output the scenarios from the LAST successful replicate 
-            # and use those for Baseline, or generate a fresh set of N_prime for final comparison.
-            # Let's use the last replicate's scenarios to be consistent.
-            final_validation_scenarios = last_replicate_scenarios
-            break
-        N += N0
-    
-    if final_validation_scenarios is None:
-        # If no convergence, use the last generated ones
-        final_validation_scenarios = last_replicate_scenarios
-        optimal_N = N
-        if v_N_reps: final_v_N_bar = np.mean(v_N_reps)
-        if v_Np_reps: final_v_Np_bar = np.mean(v_Np_reps)
-
-    # Final Solve for Visualization (Single Model)
-    print(f"[Final] Solving optimal model (N={optimal_N}) for exporting schedule...")
-    final_durations = generate_duration_samples(optimal_N)
-    m_final, x_f, s1_f, _, _, _ = build_saa_model(final_durations, optimal_N, "FINAL")
-    m_final.setParam('OutputFlag', 0)
-    m_final.setParam('TimeLimit', time_limit)
-    m_final.optimize()
-
-    class SMILPResult:
-        def __init__(self, model, opt_N, v_N, v_Np, aoi, val_scenarios):
-            self.final_model = model # Provide the model for extracting schedule
-            self.optimal_sample_size = opt_N
-            self.lower_bound = v_N
-            self.upper_bound = v_Np
-            self.aoi_history = aoi
-            self.validation_scenarios = val_scenarios # Export scenarios
-
-    return SMILPResult(m_final, optimal_N, final_v_N_bar, final_v_Np_bar, aoi_history, final_validation_scenarios)
+            return {
+                "status": m.status,
+                "obj_val": m.objVal,
+                "x": sol_x,
+                "s1": sol_s1,
+                "s2": sol_s2
+            }
+        else:
+            print("Optimization failed.")
+            return None
