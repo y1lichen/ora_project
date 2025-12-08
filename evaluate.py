@@ -135,7 +135,7 @@ def plot_waiting_time_comparison(smilp_waits, baseline_waits):
     plt.plot([1, 2], means, 'rs', label='Mean')
     
     # 標題與標籤
-    plt.title('Total Waiting Time Distribution Comparison (N=100 Test Scenarios)', fontsize=14)
+    plt.title('Total Waiting Time Distribution Comparison', fontsize=14)
     plt.ylabel('Total Waiting Time (minutes)', fontsize=12)
     plt.grid(True, axis='y', linestyle='--', alpha=0.7)
     plt.legend()
@@ -153,12 +153,12 @@ def plot_waiting_time_comparison(smilp_waits, baseline_waits):
 
 def main():
     # 參數設定
-    N_TRAIN = 30    # SAA 樣本數
-    N_TEST = 5000    # 測試樣本數
-    NUM_PATIENTS = 20
+    N_TRAIN = 20    # SAA 樣本數
+    N_TEST = 300    # 測試樣本數
+    NUM_PATIENTS = 15
     
     print(f"1. Generating Training Data (Patients={NUM_PATIENTS}, Scenarios={N_TRAIN})...")
-    gen = InstanceGenerator(num_patients=NUM_PATIENTS, arrival_interval=10)
+    gen = InstanceGenerator(num_patients=NUM_PATIENTS, arrival_interval=5)
     train_data = gen.generate_data(num_scenarios=N_TRAIN)
     
     print("2. Solving Baseline (Mean Value Model)...")
@@ -167,9 +167,8 @@ def main():
     
     print("3. Solving SMILP (Stochastic Model)...")
 
-    smilp = SMILPSolver(train_data, time_limit=3600)
-    
-    # [重要] 強制 Gurobi 專注於尋找可行解 (利用 Warm Start)
+    # smilp = SMILPSolver(train_data, time_limit=3600*1, baseline_sol=res_baseline)
+    smilp = SMILPSolver(train_data, time_limit=3600*1)
     smilp.model.setParam('MIPFocus', 1) 
     
     res_smilp = smilp.build_and_solve()
@@ -224,6 +223,27 @@ def main():
         print(f"Improvement: {(vss/avg_base)*100:.2f}%")
     else:
         print("Improvement: N/A (Baseline wait time is 0)")
+    # print("\n--- In-Sample (Training) Check ---")
+    # # 計算在 "訓練集" (30個場景) 上的 Objective
+    # # SMILP 的 Objective 已經是平均等待時間了
+    # train_obj_smilp = res_smilp['obj_val'] 
+    
+    # 計算 Baseline 在 "訓練集" 上的表現
+    # 我們需要把 Baseline 的解代入那 30 個訓練場景算一次
+    # train_wait_base = 0
+    # for n in range(N_TRAIN):
+    #     val, _ = solve_second_stage_evaluation(res_baseline, train_data, n)
+    #     train_wait_base += val
+    # train_obj_base = train_wait_base / N_TRAIN
+    
+    # print(f"Training Obj (SMILP):    {train_obj_smilp:.2f}")
+    # print(f"Training Obj (Baseline): {train_obj_base:.2f}")
+    
+    # if train_obj_smilp < train_obj_base:
+    #     print(">> SMILP improved on Training Set (Optimization worked!)")
+    #     print(">> But failed on Test Set -> This is OVERFITTING.")
+    # else:
+    #     print(">> SMILP failed to beat Baseline even on Training Set.")
 
 if __name__ == "__main__":
     main()

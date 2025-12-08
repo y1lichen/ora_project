@@ -14,13 +14,13 @@ class InstanceGenerator:
         # 1. Resource definitions (可多資源)
         # ---------------------------------------------------------
         self.resources = {
-            "Intake Nurse":     {"capacity": 1, "id": 0},
+            "Intake Nurse":     {"capacity": 3, "id": 0},
             "Radiology Tech":   {"capacity": 1,   "id": 1},
             "XRay Room":        {"capacity": 1,   "id": 2},
             "Provider":         {"capacity": 1,   "id": 3},
             "Ortho Tech":       {"capacity": 1,   "id": 4},
             "Casting Room":     {"capacity": 1,   "id": 5},
-            "Discharge Nurse":  {"capacity": 1, "id": 6},
+            "Discharge Nurse":  {"capacity": 3, "id": 6},
         }
 
         # ---------------------------------------------------------

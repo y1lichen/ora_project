@@ -1,143 +1,159 @@
 import numpy as np
-import copy
 import time
+import copy
 from instance_generator import InstanceGenerator
 from smilp_model import SMILPSolver
-from evaluate import solve_second_stage
+from evaluate import solve_second_stage_evaluation  # 重用 evaluate 中的函數
 
 class MCOOptimizer:
-    def __init__(self, num_patients=10, arrival_interval=10, 
-                 initial_n=20, sim_n_prime=100, step_size=20, 
-                 replicates_k=5, epsilon=0.05, max_n=200):
+    def __init__(self, num_patients=15, arrival_interval=10, 
+                 N0=20, K=5, N_prime=100, epsilon=0.05, 
+                 time_limit=600):
         """
-        :param initial_n: 初始優化樣本數 N0
-        :param sim_n_prime: 模擬(驗證)樣本數 N' (通常遠大於 N)
-        :param replicates_k: 每個 N 重複跑 K 次 (K replicates) 來計算統計區間
-        :param epsilon: AOI 停止條件閾值
+        復現論文 Algorithm 1: MCO Method
+        
+        :param num_patients: 病人數量
+        :param N0: 初始樣本數 (Initial sample size)
+        :param K: 重複次數 (Number of replicates)
+        :param N_prime: 模擬樣本數 (Simulation sample size N')
+        :param epsilon: 停止閾值 (Termination tolerance)
+        :param time_limit: Gurobi 求解時間限制
         """
         self.generator = InstanceGenerator(num_patients=num_patients, arrival_interval=arrival_interval)
-        
-        self.current_n = initial_n
-        self.n_prime = sim_n_prime
-        self.step_size = step_size
-        self.K = replicates_k
+        self.N = N0
+        self.K = K
+        self.N_prime = N_prime
         self.epsilon = epsilon
-        self.max_n = max_n
-
-    def generate_scenarios(self, n_samples):
-        """生成指定數量的場景數據"""
-        # 注意: 這裡我們需要一個全新的數據結構，與 generator 保持一致
-        # 為了避免重新生成病人路徑(pathway)，我們需要先生成一次基礎結構
-        # 然後只變動 duration
+        self.time_limit = time_limit
         
-        # 這裡簡化處理：我們假設每次呼叫 generate_data 都會產生同樣的病人結構
-        # 只要 random_seed 控制得當，或者我們修改 generator 讓它分開生成結構和時間
-        # *在目前的 generator 實作中，每次 generate_data 都會重骰 pathway*
-        # *這在 MCO 中是不對的，MCO 是針對「特定一組病人需求」解決問題*
-        
-        # 修正策略：先生成一次 Master Data (包含病人、路徑)，只把 durations 設為空或模板
-        if not hasattr(self, 'master_data'):
-            self.master_data = self.generator.generate_data(num_scenarios=1)
-        
-        # 複製 master data
-        data = copy.deepcopy(self.master_data)
-        data['num_scenarios'] = n_samples
-        
-        # 為每個 Activity 重新採樣 N 個 duration
-        for act in data['activities']:
-            mean = act['mean_duration']
-            var = act['var_duration']
-            mu, sigma = self.generator._convert_params_to_lognormal(mean, var)
-            # 重新抽樣
-            samples = np.maximum(1, np.round(np.random.lognormal(mu, sigma, n_samples)))
-            act['durations'] = samples.tolist()
-            
-        return data
+        # 記錄歷程
+        self.history = []
 
     def run(self):
-        print(f"Starting MCO Procedure (Target Epsilon={self.epsilon})...")
+        print(f"Starting MCO Procedure (Patients={self.generator.num_patients}, Epsilon={self.epsilon})...")
         
-        while self.current_n <= self.max_n:
-            print(f"\n--- Iteration with N = {self.current_n} ---")
+        AOI = float('inf')
+        
+        while AOI >= self.epsilon:
+            print(f"\n" + "="*50)
+            print(f"Iteration with Sample Size N = {self.N}")
+            print("="*50)
             
-            lower_bounds = []  # v_N^k (Optimization objective)
-            upper_bounds = []  # v_N'^k (Simulation objective)
+            v_N_list = []      # 存儲 K 次優化的目標值 (Lower Bound)
+            v_N_prime_list = [] # 存儲 K 次模擬的目標值 (Upper Bound)
             
-            start_time = time.time()
+            best_sol_in_this_N = None # 暫存這個 N 下最好的解
             
-            # 執行 K 次重複實驗 (Replicates)
             for k in range(self.K):
-                # 1. Generate Optimization Samples (Size N)
-                opt_data = self.generate_scenarios(self.current_n)
+                print(f"  Replicate {k+1}/{self.K}...", end=" ", flush=True)
                 
-                # 2. Solve Optimization Problem (SAA)
-                # 這裡時間限制設短一點，因為是迭代過程
-                solver = SMILPSolver(opt_data, time_limit=120, mip_gap=0.02)
-                sol = solver.build_and_solve()
+                # -------------------------------------------------
+                # Step 1: Generate (N + N') Scenarios
+                # -------------------------------------------------
+                # 生成總數據，包含 N 個訓練用 + N' 個驗證用
+                total_samples = self.N + self.N_prime
+                data = self.generator.generate_data(num_scenarios=total_samples)
                 
-                if not sol:
-                    print(f"  Replicate {k+1}: Optimization failed.")
+                # 切分數據：前 N 個給優化，後 N' 個給模擬
+                train_data = copy.deepcopy(data)
+                train_data['num_scenarios'] = self.N
+                for act in train_data['activities']:
+                    act['durations'] = act['durations'][:self.N]
+                
+                sim_data = copy.deepcopy(data)
+                # 模擬數據只保留後 N' 個 duration
+                sim_data['num_scenarios'] = self.N_prime
+                for act in sim_data['activities']:
+                    act['durations'] = act['durations'][self.N:]
+                
+                # -------------------------------------------------
+                # Step 2: Solve SAA (Optimization) -> v_N
+                # -------------------------------------------------
+                # 這裡可以使用 Warm Start (如果你有 Baseline 解的話，可以傳入)
+                # 為了簡化，這裡先裸跑，但建議加上 MIPFocus=1
+                solver = SMILPSolver(train_data, time_limit=self.time_limit)
+                solver.model.setParam('MIPFocus', 1) 
+                solver.model.setParam('OutputFlag', 0) # 關閉 Gurobi 刷屏
+                
+                res = solver.build_and_solve()
+                
+                if not res:
+                    print("[Failed] Optimization timed out or infeasible.")
                     continue
                 
-                v_opt = sol['obj_val']
-                lower_bounds.append(v_opt)
+                v_N_k = res['obj_val']
+                v_N_list.append(v_N_k)
                 
-                # 3. Generate Simulation Samples (Size N')
-                # 這是用來評估該解在真實情況(更大樣本)下的表現
-                sim_data = self.generate_scenarios(self.n_prime)
+                # -------------------------------------------------
+                # Step 3: Evaluate (Simulation) -> v_N'
+                # -------------------------------------------------
+                # 用剛算出來的 x, s1, s2 去跑 N' 個模擬場景
+                sim_wait_sum = 0
+                for n in range(self.N_prime):
+                    val, _ = solve_second_stage_evaluation(res, sim_data, n)
+                    sim_wait_sum += val
                 
-                # 4. Evaluate (Simulation Step)
-                # 固定第一階段解 sol['x'], sol['s1']...，計算 N' 個場景的平均等待時間
-                sim_vals = []
-                for n_idx in range(self.n_prime):
-                    val, _ = solve_second_stage(sol, sim_data, n_idx)
-                    sim_vals.append(val)
+                v_N_prime_k = sim_wait_sum / self.N_prime
+                v_N_prime_list.append(v_N_prime_k)
                 
-                v_sim = np.mean(sim_vals)
-                upper_bounds.append(v_sim)
+                print(f"Opt(v_N)={v_N_k:.2f}, Sim(v_N')={v_N_prime_k:.2f}")
                 
-                print(f"  Replicate {k+1}: Opt_Obj={v_opt:.2f}, Sim_Obj={v_sim:.2f}")
+                # 保存最後一輪的第一個解當作 output
+                if k == self.K - 1:
+                    best_sol_in_this_N = res
 
-            # 計算統計界限
-            avg_lower = np.mean(lower_bounds)
-            avg_upper = np.mean(upper_bounds)
+            # -------------------------------------------------
+            # Step 4: Calculate Statistics
+            # -------------------------------------------------
+            if not v_N_list:
+                print("All replicates failed. Stopping.")
+                return None
+
+            avg_v_N = np.mean(v_N_list)       # Lower Bound
+            avg_v_N_prime = np.mean(v_N_prime_list) # Upper Bound
             
-            # 計算 AOI (Approximate Optimality Index)
-            # AOI = |Upper - Lower| / Upper
-            if avg_upper == 0:
-                aoi = 0
+            # AOI Calculation (論文公式)
+            # AOI = | v_N' - v_N | / v_N'
+            if avg_v_N_prime > 0:
+                AOI = abs(avg_v_N_prime - avg_v_N) / avg_v_N_prime
             else:
-                aoi = abs(avg_upper - avg_lower) / avg_upper
+                AOI = float('inf')
+                
+            print(f"\nStats for N={self.N}:")
+            print(f"  Avg Optimization Obj (Lower Bound): {avg_v_N:.2f}")
+            print(f"  Avg Simulation Obj   (Upper Bound): {avg_v_N_prime:.2f}")
+            print(f"  Gap (Overfitting measure):          {avg_v_N_prime - avg_v_N:.2f}")
+            print(f"  AOI:                                {AOI:.4f} (Target: {self.epsilon})")
             
-            elapsed = time.time() - start_time
-            print(f"Summary N={self.current_n}: Avg Lower={avg_lower:.2f}, Avg Upper={avg_upper:.2f}")
-            print(f"AOI = {aoi:.4f} (Time: {elapsed:.2f}s)")
+            self.history.append({
+                'N': self.N,
+                'AOI': AOI,
+                'v_N': avg_v_N,
+                'v_N_prime': avg_v_N_prime
+            })
             
-            # 檢查停止條件
-            if aoi <= self.epsilon:
-                print(f"\nConvergence reached! Optimal Sample Size N = {self.current_n}")
+            if AOI < self.epsilon:
+                print(f"\n>>> CONVERGED! Optimal Sample Size found: N = {self.N}")
                 return {
-                    "optimal_N": self.current_n,
-                    "final_aoi": aoi,
-                    "lower_bound": avg_lower,
-                    "upper_bound": avg_upper
+                    "optimal_N": self.N,
+                    "final_solution": best_sol_in_this_N,
+                    "final_AOI": AOI,
+                    "lower_bound": avg_v_N,
+                    "upper_bound": avg_v_N_prime
                 }
             
-            # 增加樣本數
-            self.current_n += self.step_size
-
-        print("\nMax sample size reached without convergence.")
+            # Update N: 論文說 N <- 2N
+            self.N = self.N * 2
+            
+            # 安全閥：防止 N 爆炸導致算不動
+            if self.N > 200:
+                print("\n>>> Reached max sample size limit (200). Stopping.")
+                return {
+                    "optimal_N": self.N, # 雖然沒收斂，但回傳目前最大的
+                    "final_solution": best_sol_in_this_N,
+                    "final_AOI": AOI,
+                    "lower_bound": avg_v_N,
+                    "upper_bound": avg_v_N_prime
+                }
+        
         return None
-
-if __name__ == "__main__":
-    # 測試 MCO
-    mco = MCOOptimizer(
-        num_patients=20,       # 為了測試速度，病人少一點
-        arrival_interval=15, 
-        initial_n=10, 
-        sim_n_prime=50,       # 模擬樣本數
-        step_size=10, 
-        replicates_k=3,       # 重複次數
-        epsilon=0.05          # 5% gap
-    )
-    mco.run()
