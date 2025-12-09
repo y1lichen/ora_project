@@ -158,7 +158,8 @@ def main():
     NUM_PATIENTS = 15
     
     print(f"1. Generating Training Data (Patients={NUM_PATIENTS}, Scenarios={N_TRAIN})...")
-    gen = InstanceGenerator(num_patients=NUM_PATIENTS, arrival_interval=5)
+    # gen = InstanceGenerator(num_patients=NUM_PATIENTS, arrival_interval=5)
+    gen = InstanceGenerator(num_patients=NUM_PATIENTS, arrival_interval=7)
     train_data = gen.generate_data(num_scenarios=N_TRAIN)
     
     print("2. Solving Baseline (Mean Value Model)...")
