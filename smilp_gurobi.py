@@ -1,12 +1,16 @@
-# smilp_gurobi.py
+# smilp_paper_compliant.py
 # Requires gurobipy installed and a valid Gurobi license.
 from gurobipy import Model, GRB, quicksum
 import math
 import copy
-from instance_generator import InstanceGenerator
+import numpy as np
 import matplotlib.pyplot as plt
+# 假設 instance_generator.py 與此檔案在同一目錄
+from instance_generator import InstanceGenerator 
 
-
+# ==========================================
+# 1. 資料預處理 (Data Preprocessing)
+# ==========================================
 def build_index_sets(data):
     # Activities A
     activities = data["activities"]
@@ -22,7 +26,7 @@ def build_index_sets(data):
     G = list(resources_by_type.keys())
     Jg = {g: [unit["uid"] for unit in resources_by_type[g]] for g in G}
 
-    # For each activity a, determine which resource types it requires (A(g) sets)
+    # A(g): Activities requiring resource type g
     A_g = {g: [] for g in G}
     for act in activities:
         for g in act["required_types"]:
@@ -30,7 +34,7 @@ def build_index_sets(data):
                 A_g[g] = []
             A_g[g].append(act["id"])
 
-    # Build useful helper: for each activity a, list eligible resource units j (whose type in required_types)
+    # eligible_j_for_a: Pre-calculate eligible resources to reduce variables
     eligible_j_for_a = {}
     for act in activities:
         a = act["id"]
@@ -39,190 +43,119 @@ def build_index_sets(data):
             if g not in Jg:
                 raise ValueError(f"Activity {a} requires unknown resource type {g}")
             eligible.extend(Jg[g])
-        # remove duplicates
         eligible_j_for_a[a] = list(sorted(set(eligible)))
 
     return {
-        "A": A,
-        "A_info": act_by_id,
-        "J": J,
-        "G": G,
-        "Jg": Jg,
-        "A_g": A_g,
-        "eligible_j_for_a": eligible_j_for_a
+        "A": A, "A_info": act_by_id, "J": J, "G": G,
+        "Jg": Jg, "A_g": A_g, "eligible_j_for_a": eligible_j_for_a
     }
 
-def build_smilp_model(data, M=1000, time_limit=None, verbose=True):
+# ==========================================
+# 2. 模型建構：訓練階段 (Training Phase)
+# ==========================================
+
+def solve_smilp_training(data, M=1000, time_limit=600, verbose=True):
     """
-    Build and solve the two-stage SMILP via SAA deterministic equivalent:
-    - First-stage binaries: x[a,j], sa1[a,a2], sa2[a,a2], q[j,a,a2]
-    - Second-stage continuous: b[a,k] for each scenario k
-    Objective: minimize (1/num_scenarios) * sum_k Q_k
-    Returns: model, solution dict with first-stage variables and objective info.
+    論文中的 SMILP 模型 (Formulation 1 & 2)。
+    使用 N0 (Training) 樣本數來決定最佳的第一階段變數 (x, sa1, sa2, q)。
     """
     idx = build_index_sets(data)
-    A = idx["A"]
-    A_info = idx["A_info"]
-    J = idx["J"]
-    G = idx["G"]
-    Jg = idx["Jg"]
+    A, A_info = idx["A"], idx["A_info"]
+    J, Jg, G = idx["J"], idx["Jg"], idx["G"]
     eligible = idx["eligible_j_for_a"]
     num_scenarios = data["num_scenarios"]
     scenarios = list(range(num_scenarios))
 
-    # Va_g: number of resources of type g required by activity a
-    # From your data "required_types" list, assume each listed type needs 1 unit
-    Va_g = {}
-    for a in A:
-        req_types = A_info[a]["required_types"]
-        for g in req_types:
-            Va_g[(a,g)] = 1  # if in future you have counts, change here
-
-    # resource capacities k_j: each resource unit has capacity 1
+    # Parameters
+    Va_g = {(a,g): 1 for a in A for g in A_info[a]["required_types"]}
     k_j = {j: 1 for j in J}
-
-    # scheduled times t_a for initial activities; None otherwise
     t_a = {a: (A_info[a]["scheduled_start"] if A_info[a]["is_start"] else None) for a in A}
-
-    # predecessor mapping pre[a] = predecessor activity id or None
     pre = {a: A_info[a]["predecessor"] for a in A}
-
-    # durations per scenario d[a,k]
+    
+    # Durations d[a,k]
     d = {}
     for a in A:
         dur_list = A_info[a]["durations"]
-        if len(dur_list) != num_scenarios:
-            raise ValueError(f"Activity {a} durations length {len(dur_list)} != num_scenarios {num_scenarios}")
         for k in scenarios:
             d[(a,k)] = float(dur_list[k])
 
-    # Build pairs (a,a') that share at least one resource type (used for s1, s2, q constraints)
+    # Share Pairs
     share_pairs = []
     for a in A:
         types_a = set(A_info[a]["required_types"])
         for a2 in A:
-            if a == a2:
-                continue
-            types_a2 = set(A_info[a2]["required_types"])
-            if len(types_a & types_a2) > 0:
+            if a == a2: continue
+            if len(types_a & set(A_info[a2]["required_types"])) > 0:
                 share_pairs.append((a,a2))
-    # We'll also need mapping for each g of activity pairs within A(g)
-    pairs_by_g = {g: [] for g in G}
-    for g in G:
-        acts = idx["A_g"].get(g, [])
-        for i in range(len(acts)):
-            for j2 in range(len(acts)):
-                if acts[i] == acts[j2]:
-                    continue
-                pairs_by_g[g].append((acts[i], acts[j2]))
 
-    # --- Start building model ---
-    model = Model("SMILP_SAA")
-    if time_limit is not None:
-        model.setParam('TimeLimit', time_limit)
-    if not verbose:
-        model.setParam('OutputFlag', 0)
+    # Model
+    model = Model("SMILP_Training")
+    if time_limit: model.setParam('TimeLimit', time_limit)
+    # if not verbose: model.setParam('OutputFlag', 0)
 
-    # First-stage variables
-    x = {}      # x[a,j] binary assignment if resource j serves activity a (eligible j)
+    # --- Stage 1 Variables (Here and Now) ---
+    x = {}
     for a in A:
         for j in eligible[a]:
             x[(a,j)] = model.addVar(vtype=GRB.BINARY, name=f"x_{a}_{j}")
 
-    sa1 = {}    # sa1[a,a2] binary
-    sa2 = {}    # sa2[a,a2] binary
+    sa1, sa2, q = {}, {}, {}
     for (a,a2) in share_pairs:
         sa1[(a,a2)] = model.addVar(vtype=GRB.BINARY, name=f"sa1_{a}_{a2}")
         sa2[(a,a2)] = model.addVar(vtype=GRB.BINARY, name=f"sa2_{a}_{a2}")
-
-    q = {}      # q[j,a,a2] binary only when j in intersection of eligible units for both activities
-    for (a,a2) in share_pairs:
-        # j must be a resource unit whose type is in intersection of types
+        
         types_inter = set(A_info[a]["required_types"]) & set(A_info[a2]["required_types"])
-        js = []
-        for g in types_inter:
-            js.extend(Jg[g])
-        js = list(sorted(set(js)))
+        js = sorted(list(set([j for g in types_inter for j in Jg[g]])))
         for j in js:
             q[(j,a,a2)] = model.addVar(vtype=GRB.BINARY, name=f"q_{j}_{a}_{a2}")
 
     model.update()
 
-    # Second-stage variables: start times b[a,k] continuous >=0
+    # --- Stage 2 Variables (Wait and See) ---
     b = {}
     for a in A:
         for k in scenarios:
             b[(a,k)] = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name=f"b_{a}_{k}")
 
-    model.update()
-
-    # ---------- First-stage constraints ----------
-    # (1b) Va,g = sum_{j in Jg} x_a_j  for all a, g in required_types of a
+    # --- Stage 1 Constraints ---
+    # (1b) Assignment
     for a in A:
         for g in A_info[a]["required_types"]:
-            lhs = quicksum(x[(a,j)] for j in Jg[g] if (a,j) in x)
-            model.addConstr(lhs == Va_g[(a,g)], name=f"assign_count_a{a}_g{g}")
+            model.addConstr(quicksum(x[(a,j)] for j in Jg[g] if (a,j) in x) == 1)
 
-    # (1c) q_j_a_a' >= sa1_a_a' + sa2_a_a' + x_a_j + x_a'_j - 3
+    # (1c) q definition logic
     for (j,a,a2), qvar in q.items():
-        # sa1 and sa2 exist for pair
-        model.addConstr(qvar >= sa1[(a,a2)] + sa2[(a,a2)] + x.get((a,j), 0) + x.get((a2,j), 0) - 3,
-                        name=f"q_lin1_{j}_{a}_{a2}")
+        model.addConstr(qvar >= sa1[(a,a2)] + sa2[(a,a2)] + x.get((a,j),0) + x.get((a2,j),0) - 3)
 
-    # (1d) sum_{a' != a} q_j_a_a' <= k_j - 1   for each g, j in Jg, a in A(g)
-    # Implement for each resource unit j: for each a that requires j's type
+    # (1d) Capacity via q
     for g in G:
         for j in Jg[g]:
-            # all activities a in A(g)
             acts = idx["A_g"].get(g, [])
             for a in acts:
+                # Sum of q over other activities a2
                 lhs = quicksum(q[(j,a,a2)] for a2 in acts if a2 != a and (j,a,a2) in q)
-                model.addConstr(lhs <= k_j[j] - 1, name=f"cap_q_j{j}_a{a}")
+                model.addConstr(lhs <= k_j[j] - 1)
 
-    # ---------- Second-stage constraints (for each scenario) ----------
-    # (2b) ba - ta >= 0 for a in A0 (initial activities)
-    for a in A:
-        if A_info[a]["is_start"]:
-            ta = t_a[a]
-            if ta is None:
-                raise ValueError(f"Activity {a} marked is_start but scheduled_start missing")
-            for k in scenarios:
-                model.addConstr(b[(a,k)] - ta >= 0, name=f"init_time_a{a}_k{k}")
+    # --- Stage 2 Constraints ---
+    for k in scenarios:
+        # (2b & 2c) Precedence
+        for a in A:
+            if A_info[a]["is_start"]:
+                model.addConstr(b[(a,k)] >= t_a[a])
+            else:
+                prev = pre[a]
+                model.addConstr(b[(a,k)] >= b[(prev,k)] + d[(prev,k)])
 
-    # (2c) ba - b_pre - d_pre >= 0 for a in A1
-    for a in A:
-        if not A_info[a]["is_start"]:
-            prev = pre[a]
-            if prev is None:
-                raise ValueError(f"Activity {a} not start but predecessor missing")
-            for k in scenarios:
-                model.addConstr(b[(a,k)] - b[(prev,k)] - d[(prev,k)] >= 0, name=f"succ_time_a{a}_k{k}")
+        # (2d-2g) Big-M Sequencing
+        for (a,a2) in share_pairs:
+            # Note: Using M=1000 effectively
+            model.addConstr(M * sa1[(a,a2)] >= b[(a,k)] - b[(a2,k)] + 1)
+            model.addConstr(M * (1 - sa1[(a,a2)]) >= b[(a2,k)] - b[(a,k)])
+            model.addConstr(M * sa2[(a,a2)] >= b[(a2,k)] - b[(a,k)] + d[(a2,k)])
+            model.addConstr(M * (1 - sa2[(a,a2)]) >= b[(a,k)] - b[(a2,k)] - d[(a2,k)] + 1)
 
-    # (2d)-(2g) big-M sequencing constraints for activities sharing resource types
-    # For each g and pairs (a,a') in A(g) apply (2d)-(2g)
-    for g in G:
-        acts = idx["A_g"].get(g, [])
-        for a in acts:
-            for a2 in acts:
-                if a == a2:
-                    continue
-                for k in scenarios:
-                    # (2d) M * sa1 >= b_a - b_a' + 1
-                    model.addConstr(M * sa1[(a,a2)] >= b[(a,k)] - b[(a2,k)] + 1,
-                                    name=f"2d_g{g}_a{a}_a2{a2}_k{k}")
-                    # (2e) M*(1 - sa1) >= b_a' - b_a
-                    model.addConstr(M * (1 - sa1[(a,a2)]) >= b[(a2,k)] - b[(a,k)],
-                                    name=f"2e_g{g}_a{a}_a2{a2}_k{k}")
-                    # (2f) M * sa2 >= b_a' - b_a + d_a'
-                    model.addConstr(M * sa2[(a,a2)] >= b[(a2,k)] - b[(a,k)] + d[(a2,k)],
-                                    name=f"2f_g{g}_a{a}_a2{a2}_k{k}")
-                    # (2g) M*(1 - sa2) >= b_a - b_a' - d_a' + 1
-                    model.addConstr(M * (1 - sa2[(a,a2)]) >= b[(a,k)] - b[(a2,k)] - d[(a2,k)] + 1,
-                                    name=f"2g_g{g}_a{a}_a2{a2}_k{k}")
-
-    # ---------- Objective: average over scenarios of waiting time Q(x,ξ_k) ----------
-    # For each scenario k, Q_k = sum_{a in A0} (b_a - t_a) + sum_{a in A1} (b_a - b_pre - d_pre)
-    Q_per_k = {}
+    # Objective: Min Avg Waiting Time
+    Q_k_terms = []
     for k in scenarios:
         terms = []
         for a in A:
@@ -231,282 +164,296 @@ def build_smilp_model(data, M=1000, time_limit=None, verbose=True):
             else:
                 prev = pre[a]
                 terms.append(b[(a,k)] - b[(prev,k)] - d[(prev,k)])
-        Q_per_k[k] = quicksum(terms)
-
-    # Average
-    objective = (1.0 / num_scenarios) * quicksum(Q_per_k[k] for k in scenarios)
-    model.setObjective(objective, GRB.MINIMIZE)
-
-    # Solve
-    model.update()
+        Q_k_terms.append(quicksum(terms))
+    
+    model.setObjective((1.0/num_scenarios) * quicksum(Q_k_terms), GRB.MINIMIZE)
+    
+    print(f"Solving SMILP with {num_scenarios} scenarios...")
     model.optimize()
 
-    # Retrieve first-stage variable values and objective
-    sol = {
-        "obj": model.ObjVal if model.Status == GRB.OPTIMAL or model.Status == GRB.TIME_LIMIT or model.Status == GRB.OPTIMAL else None,
-        "x": {(a,j): (x[(a,j)].X if (a,j) in x else 0) for a in A for j in eligible[a]},
-        "sa1": {(a,a2): sa1[(a,a2)].X for (a,a2) in sa1},
-        "sa2": {(a,a2): sa2[(a,a2)].X for (a,a2) in sa2},
-        "q": {(j,a,a2): q[(j,a,a2)].X for (j,a,a2) in q},
-        "Q_per_scenario": {k: (Q_per_k[k].getValue() if hasattr(Q_per_k[k], "getValue") else None) for k in scenarios}
+    # Extract First-Stage Solution ONLY
+    sol_first_stage = {
+        "x": {(a,j): 1 for (a,j) in x if x[(a,j)].X > 0.5},
+        "sa1": {(a,a2): 1 for (a,a2) in sa1 if sa1[(a,a2)].X > 0.5},
+        "sa2": {(a,a2): 1 for (a,a2) in sa2 if sa2[(a,a2)].X > 0.5},
+        # q is derived, but can be passed if needed. Usually x, sa1, sa2 are sufficient to fix schedule.
     }
+    return sol_first_stage
 
-    return model, sol
-
-def build_baseline_mean_model(data, M=1000, time_limit=None, verbose=True):
+def solve_baseline_training(data, M=1000, time_limit=600):
     """
-    Build deterministic baseline model under mean durations.
-    Steps:
-      1) Build deterministic MILP where durations = mean_duration for each activity.
-         Solve for first-stage variables x, sa1, sa2, q and deterministic b[a].
-      2) Fix the first-stage variables from step 1, and for each scenario k solve
-         the second-stage (only b[a,k] continuous) to compute Q_k.
-      3) Return baseline first-stage solution and average Q over scenarios.
+    論文中的 Baseline Mean Value Model。
+    只看「平均工期」來解一個 Deterministic MILP。
     """
     idx = build_index_sets(data)
-    A = idx["A"]
-    A_info = idx["A_info"]
-    J = idx["J"]
-    G = idx["G"]
-    Jg = idx["Jg"]
+    A, A_info = idx["A"], idx["A_info"]
+    J, Jg, G = idx["J"], idx["Jg"], idx["G"]
     eligible = idx["eligible_j_for_a"]
-    num_scenarios = data["num_scenarios"]
-    scenarios = list(range(num_scenarios))
 
-    # Va_g set to 1 for each required type
-    Va_g = {}
-    for a in A:
-        for g in A_info[a]["required_types"]:
-            Va_g[(a,g)] = 1
-
-    k_j = {j: 1 for j in J}
+    # Use Mean Durations
+    mean_d = {a: float(A_info[a]["mean_duration"]) for a in A}
     t_a = {a: (A_info[a]["scheduled_start"] if A_info[a]["is_start"] else None) for a in A}
     pre = {a: A_info[a]["predecessor"] for a in A}
-    # mean durations
-    mean_d = {a: float(A_info[a]["mean_duration"]) for a in A}
+    
+    # Model
+    model = Model("Baseline_Mean")
+    # model.setParam('OutputFlag', 0)
+    if time_limit: model.setParam('TimeLimit', time_limit)
 
-    # Build deterministic model (single scenario with b[a])
-    model = Model("Baseline_mean_det")
-    if time_limit is not None:
-        model.setParam('TimeLimit', time_limit)
-    if not verbose:
-        model.setParam('OutputFlag', 0)
-
-    # First-stage vars
+    # Variables (Same structure, but no scenario index k)
     x = {}
     for a in A:
         for j in eligible[a]:
-            x[(a,j)] = model.addVar(vtype=GRB.BINARY, name=f"x_{a}_{j}")
-    sa1 = {}
-    sa2 = {}
+            x[(a,j)] = model.addVar(vtype=GRB.BINARY)
+    
     share_pairs = []
+    sa1, sa2, q = {}, {}, {}
     for a in A:
         for a2 in A:
-            if a == a2:
-                continue
+            if a == a2: continue
             if len(set(A_info[a]["required_types"]) & set(A_info[a2]["required_types"])) > 0:
                 share_pairs.append((a,a2))
-                sa1[(a,a2)] = model.addVar(vtype=GRB.BINARY, name=f"sa1_{a}_{a2}")
-                sa2[(a,a2)] = model.addVar(vtype=GRB.BINARY, name=f"sa2_{a}_{a2}")
-    q = {}
-    for (a,a2) in share_pairs:
-        types_inter = set(A_info[a]["required_types"]) & set(A_info[a2]["required_types"])
-        js = []
-        for g in types_inter:
-            js.extend(Jg[g])
-        js = list(sorted(set(js)))
-        for j in js:
-            q[(j,a,a2)] = model.addVar(vtype=GRB.BINARY, name=f"q_{j}_{a}_{a2}")
-    model.update()
+                sa1[(a,a2)] = model.addVar(vtype=GRB.BINARY)
+                sa2[(a,a2)] = model.addVar(vtype=GRB.BINARY)
+                # q generation simplified for brevity, similar to SMILP
+                types_inter = set(A_info[a]["required_types"]) & set(A_info[a2]["required_types"])
+                js = sorted(list(set([j for g in types_inter for j in Jg[g]])))
+                for j in js:
+                    q[(j,a,a2)] = model.addVar(vtype=GRB.BINARY)
 
-    # deterministic b[a] (single)
-    b = {}
-    for a in A:
-        b[a] = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name=f"b_{a}")
-    model.update()
+    b = {a: model.addVar(lb=0.0) for a in A}
 
-    # constraints same structure as SMILP but with mean durations
+    # Constraints (Same logic as SMILP but deterministic)
     # (1b)
     for a in A:
         for g in A_info[a]["required_types"]:
-            lhs = quicksum(x[(a,j)] for j in Jg[g] if (a,j) in x)
-            model.addConstr(lhs == Va_g[(a,g)], name=f"assign_count_a{a}_g{g}")
-
-    # (1c)
+            model.addConstr(quicksum(x[(a,j)] for j in Jg[g] if (a,j) in x) == 1)
+    
+    # (1c & 1d) Q logic and Capacity
     for (j,a,a2), qvar in q.items():
-        model.addConstr(qvar >= sa1[(a,a2)] + sa2[(a,a2)] + x.get((a,j),0) + x.get((a2,j),0) - 3,
-                        name=f"q_lin1_{j}_{a}_{a2}")
-
-    # (1d)
+        model.addConstr(qvar >= sa1[(a,a2)] + sa2[(a,a2)] + x.get((a,j),0) + x.get((a2,j),0) - 3)
+    
+    # Capacity simplified loop
     for g in G:
         for j in Jg[g]:
             acts = idx["A_g"].get(g, [])
             for a in acts:
                 lhs = quicksum(q[(j,a,a2)] for a2 in acts if a2 != a and (j,a,a2) in q)
-                model.addConstr(lhs <= k_j[j] - 1, name=f"cap_q_j{j}_a{a}")
+                model.addConstr(lhs <= 1 - 1) # capacity is 1
 
-    # (2b) and (2c) with mean durations
+    # Deterministic Sequencing & Timing
     for a in A:
         if A_info[a]["is_start"]:
-            ta = t_a[a]
-            for a_var in [a]:
-                model.addConstr(b[a_var] - ta >= 0, name=f"init_time_a{a}")
+            model.addConstr(b[a] >= t_a[a])
         else:
             prev = pre[a]
-            model.addConstr(b[a] - b[prev] - mean_d[prev] >= 0, name=f"succ_time_a{a}")
+            model.addConstr(b[a] >= b[prev] + mean_d[prev])
+    
+    for (a,a2) in share_pairs:
+        model.addConstr(M * sa1[(a,a2)] >= b[a] - b[a2] + 1)
+        model.addConstr(M * (1 - sa1[(a,a2)]) >= b[a2] - b[a])
+        model.addConstr(M * sa2[(a,a2)] >= b[a2] - b[a] + mean_d[a2])
+        model.addConstr(M * (1 - sa2[(a,a2)]) >= b[a] - b[a2] - mean_d[a2] + 1)
 
-    # (2d)-(2g) with mean durations
-    for g in G:
-        acts = idx["A_g"].get(g, [])
-        for a in acts:
-            for a2 in acts:
-                if a == a2:
-                    continue
-                # (2d)
-                model.addConstr(M * sa1[(a,a2)] >= b[a] - b[a2] + 1, name=f"2d_g{g}_a{a}_a2{a2}")
-                model.addConstr(M * (1 - sa1[(a,a2)]) >= b[a2] - b[a], name=f"2e_g{g}_a{a}_a2{a2}")
-                model.addConstr(M * sa2[(a,a2)] >= b[a2] - b[a] + mean_d[a2], name=f"2f_g{g}_a{a}_a2{a2}")
-                model.addConstr(M * (1 - sa2[(a,a2)]) >= b[a] - b[a2] - mean_d[a2] + 1, name=f"2g_g{g}_a{a}_a2{a2}")
-
-    # Objective: total waiting under mean durations
+    # Objective
     terms = []
     for a in A:
-        if A_info[a]["is_start"]:
-            terms.append(b[a] - t_a[a])
-        else:
-            p = pre[a]
-            terms.append(b[a] - b[p] - mean_d[p])
+        if A_info[a]["is_start"]: terms.append(b[a] - t_a[a])
+        else: terms.append(b[a] - b[pre[a]] - mean_d[pre[a]])
     model.setObjective(quicksum(terms), GRB.MINIMIZE)
 
-    model.update()
+    print("Solving Baseline Deterministic Model...")
     model.optimize()
 
-    if model.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT):
-        print("Baseline deterministic model did not solve optimally; status:", model.Status)
+    sol_first_stage = {
+        "x": {(a,j): 1 for (a,j) in x if x[(a,j)].X > 0.5},
+        "sa1": {(a,a2): 1 for (a,a2) in sa1 if sa1[(a,a2)].X > 0.5},
+        "sa2": {(a,a2): 1 for (a,a2) in sa2 if sa2[(a,a2)].X > 0.5},
+    }
+    return sol_first_stage
 
-    # Extract first-stage solution
-    x_sol = {(a,j): x[(a,j)].X for (a,j) in x}
-    sa1_sol = {(a,a2): sa1[(a,a2)].X for (a,a2) in sa1}
-    sa2_sol = {(a,a2): sa2[(a,a2)].X for (a,a2) in sa2}
-    q_sol = {(j,a,a2): q[(j,a,a2)].X for (j,a,a2) in q}
+# ==========================================
+# 3. 評估階段 (Evaluation / Testing Phase)
+# ==========================================
 
-    # Evaluation: fix these first-stage binaries, solve second-stage for each scenario separately (only b vars)
-    # We'll create a small LP for each scenario k
-    Q_vals = []
+def evaluate_solution_on_scenarios(first_stage_sol, test_data, M=1000):
+    """
+    Monte Carlo Simulation 步驟：
+    將固定的第一階段變數 (x, sa1, sa2) 套用到 N' (Test) 個情境中。
+    針對每個情境 k，這變成一個簡單的 LP (因為 binary 都固定了)。
+    """
+    idx = build_index_sets(test_data)
+    A, A_info = idx["A"], idx["A_info"]
+    scenarios = list(range(test_data["num_scenarios"]))
+    t_a = {a: (A_info[a]["scheduled_start"] if A_info[a]["is_start"] else None) for a in A}
+    pre = {a: A_info[a]["predecessor"] for a in A}
+
+    # Retrieve fixed decisions
+    x_fixed = first_stage_sol["x"]
+    sa1_fixed = first_stage_sol["sa1"]
+    sa2_fixed = first_stage_sol["sa2"]
+
+    Q_values = []
+    print(f"Evaluating solution on {len(scenarios)} testing scenarios...")
+
+    # Reuse model environment for speed? Or create new. Creating new is safer for clarity.
+    # For 500 scenarios, creating 500 small models is fast enough.
+    
     for k in scenarios:
-        eval_model = Model(f"baseline_eval_k{k}")
-        eval_model.setParam('OutputFlag', 0)
-        # b[a,k] continuous
-        b_k = {a: eval_model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name=f"b_{a}") for a in A}
-        eval_model.update()
+        # Build a simple LP for this specific scenario
+        eval_model = Model(f"Eval_k{k}")
+        # eval_model.setParam('OutputFlag', 0)
+        
+        # Variables: only b[a]
+        b = {a: eval_model.addVar(lb=0.0, name=f"b_{a}") for a in A}
+        
+        # Get duration for THIS scenario
+        d_k = {a: float(A_info[a]["durations"][k]) for a in A}
 
-        # (2b)
+        # Constraints
+        # (2b & 2c)
         for a in A:
             if A_info[a]["is_start"]:
-                eval_model.addConstr(b_k[a] - t_a[a] >= 0, name=f"init_a{a}_k{k}")
+                eval_model.addConstr(b[a] >= t_a[a])
             else:
                 prev = pre[a]
-                eval_model.addConstr(b_k[a] - b_k[prev] - data["activities"][0]["durations"][k] >= 0, name=f"succ_a{a}_k{k}")
-                # Note: above line is placeholder; below we'll use actual d[(prev,k)]
-        # But we need to use correct durations per activity/version:
-        # Rebuild with correct d[(a,k)]
-        eval_model.remove(eval_model.getConstrs())  # remove possibly bad constraints; rebuild correctly
+                eval_model.addConstr(b[a] >= b[prev] + d_k[prev])
+
+        # (2d-2g) Sequencing - NOW THESE ARE LINEAR CONSTRAINTS because sa1/sa2 are constants
+        # Identify pairs sharing resources
+        # We need to loop through the sa1 keys from the solution
+        for (a,a2), val_sa1 in sa1_fixed.items():
+            val_sa2 = sa2_fixed.get((a,a2), 0)
+            
+            # Constraints using constants 0 or 1
+            eval_model.addConstr(M * val_sa1 >= b[a] - b[a2] + 1)
+            eval_model.addConstr(M * (1 - val_sa1) >= b[a2] - b[a])
+            eval_model.addConstr(M * val_sa2 >= b[a2] - b[a] + d_k[a2])
+            eval_model.addConstr(M * (1 - val_sa2) >= b[a] - b[a2] - d_k[a2] + 1)
+
+        # Objective: Wait time for scenario k
+        terms = []
         for a in A:
             if A_info[a]["is_start"]:
-                eval_model.addConstr(b_k[a] - t_a[a] >= 0, name=f"init_a{a}_k{k}")
+                terms.append(b[a] - t_a[a])
             else:
-                prev = pre[a]
-                duration_prev = float(A_info[prev]["durations"][k])
-                eval_model.addConstr(b_k[a] - b_k[prev] - duration_prev >= 0, name=f"succ_a{a}_k{k}")
-
-        # sequencing constraints (2d)-(2g) using fixed sa1/sa2 values from deterministic solution
-        for g in G:
-            acts = idx["A_g"].get(g, [])
-            for a in acts:
-                for a2 in acts:
-                    if a == a2:
-                        continue
-                    val_sa1 = sa1_sol.get((a,a2), 0)
-                    val_sa2 = sa2_sol.get((a,a2), 0)
-                    # implement as inequalities (no binaries)
-                    eval_model.addConstr(M * val_sa1 >= b_k[a] - b_k[a2] + 1, name=f"eval_2d_g{g}_a{a}_a2{a2}_k{k}")
-                    eval_model.addConstr(M * (1 - val_sa1) >= b_k[a2] - b_k[a], name=f"eval_2e_g{g}_a{a}_a2{a2}_k{k}")
-                    duration_a2 = float(A_info[a2]["durations"][k])
-                    eval_model.addConstr(M * val_sa2 >= b_k[a2] - b_k[a] + duration_a2, name=f"eval_2f_g{g}_a{a}_a2{a2}_k{k}")
-                    eval_model.addConstr(M * (1 - val_sa2) >= b_k[a] - b_k[a2] - duration_a2 + 1, name=f"eval_2g_g{g}_a{a}_a2{a2}_k{k}")
-
-        # Objective Q_k
-        terms_k = []
-        for a in A:
-            if A_info[a]["is_start"]:
-                terms_k.append(b_k[a] - t_a[a])
-            else:
-                prev = pre[a]
-                duration_prev = float(A_info[prev]["durations"][k])
-                terms_k.append(b_k[a] - b_k[prev] - duration_prev)
-        eval_model.setObjective(quicksum(terms_k), GRB.MINIMIZE)
-        eval_model.update()
+                terms.append(b[a] - b[pre[a]] - d_k[pre[a]])
+        
+        eval_model.setObjective(quicksum(terms), GRB.MINIMIZE)
         eval_model.optimize()
 
-        if eval_model.Status == GRB.OPTIMAL or model.Status == GRB.TIME_LIMIT:
-            Q_vals.append(eval_model.ObjVal)
+        if eval_model.Status == GRB.OPTIMAL:
+            Q_values.append(eval_model.ObjVal)
         else:
-            print(f"Eval scenario k {k} not optimal; status {eval_model.Status}")
-            Q_vals.append(10000) # penalty
+            # 若因 M 不夠大或其他原因導致 infeasible，給予罰分 (Penalty)
+            # 在論文假設 Assumption 2 (資源充足) 下，應該總是可行的
+            Q_values.append(10000.0) 
 
+    return Q_values
 
-    v_base = sum(Q_vals) / len(Q_vals)
+# ==========================================
+# 4. 視覺化 (Visualization)
+# ==========================================
 
-    return {
-        "first_stage": {
-            "x": x_sol,
-            "sa1": sa1_sol,
-            "sa2": sa2_sol,
-            "q": q_sol
-        },
-        "v_base": v_base,
-        "Q_vals": Q_vals
-    }
+def plot_paper_comparison(smilp_Q, baseline_Q):
+    smilp_vals = [v for v in smilp_Q if v < 9000]
+    baseline_vals = [v for v in baseline_Q if v < 9000]
 
-def plot_comparison_boxplot(smilp_Q, baseline_Q, infeasible_threshold=9000):
+    smilp_mean = np.mean(smilp_vals)
+    baseline_mean = np.mean(baseline_vals)
+    
+    # VSS Calculation
+    vss = baseline_mean - smilp_mean
+    improvement_pct = (vss / baseline_mean) * 100 if baseline_mean > 0 else 0
+
+    text_str = (f"Baseline Avg: {baseline_mean:.2f}\n"
+                f"SMILP Avg: {smilp_mean:.2f}\n"
+                f"VSS (Diff): {vss:.2f}\n"
+                f"Improvement: {improvement_pct:.2f}%")
+
+    plt.figure(figsize=(9, 6))
+    plt.boxplot([baseline_vals, smilp_vals], labels=["Baseline (Mean Value)", "SMILP (Stochastic)"], 
+                showmeans=True, patch_artist=True)
+    
+    plt.ylabel("Total Patient Waiting Time (mins)")
+    plt.title(f"Evaluation on Out-of-Sample Scenarios (N={len(smilp_Q)})")
+    
+    # Add text box
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+    plt.text(0.05, 0.95, text_str, transform=plt.gca().transAxes, fontsize=12,
+             verticalalignment='top', bbox=props)
+    
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.savefig("smilp_paper_result.png")
+    print(f"\n=== Final Results ===")
+    print(text_str)
+    print("Plot saved to smilp_paper_result.png")
+
+# ==========================================
+# 5. 主程式 (Main Execution)
+# ==========================================
+def split_data(full_data, n_train, n_test):
     """
-    smilp_Q: dict {k: Q_k}
-    baseline_Q: list [Q_k]
-    infeasible_threshold: values >= this will be removed
+    將一份包含 (n_train + n_test) 個情境的資料集切分成兩份。
+    保持 Activities 結構不變，只切分 durations 列表。
     """
+    import copy
+    
+    # 深層複製以避免修改原始資料
+    # 注意：如果資料量極大，deepcopy 會慢，但在這裡應該還好
+    train_data = copy.deepcopy(full_data)
+    test_data = copy.deepcopy(full_data)
+    
+    total_scenarios = full_data["num_scenarios"]
+    if total_scenarios < n_train + n_test:
+        raise ValueError(f"Data has {total_scenarios} scenarios, but need {n_train} + {n_test}")
 
-    # 轉成 list
-    smilp_vals = [v for v in smilp_Q.values() if v < infeasible_threshold]
-    baseline_vals = [v for v in baseline_Q if v < infeasible_threshold]
+    # 修改 Train Data
+    train_data["num_scenarios"] = n_train
+    for act in train_data["activities"]:
+        # 取前 n_train 個情境
+        act["durations"] = act["durations"][:n_train]
+        
+    # 修改 Test Data
+    test_data["num_scenarios"] = n_test
+    for act in test_data["activities"]:
+        # 取後 n_test 個情境
+        # 重要：必須讓 test 的情境索引重新從 0 開始，以配合 evaluate 函式的迴圈
+        act["durations"] = act["durations"][n_train : n_train + n_test]
 
-    # 檢查是否有剩資料
-    if len(smilp_vals) == 0 or len(baseline_vals) == 0:
-        print("Warning: no feasible scenario values to plot.")
-        return
+    return train_data, test_data
 
-    plt.figure(figsize=(8, 5))
-    plt.boxplot([smilp_vals, baseline_vals], labels=["SMILP", "Baseline"], showmeans=True)
-
-    plt.ylabel("Scenario Q value")
-    plt.title("Comparison of SMILP vs Baseline (Feasible Scenarios Only)")
-    plt.grid(axis='y', linestyle='--', alpha=0.5)
-    plt.tight_layout()
-    # plt.show()
-    plt.savefig("smilp_vs_baseline_boxplot.png")
-# ---------------------------
-# Example usage with your provided data dict:
 if __name__ == "__main__":
-    generator = InstanceGenerator(num_patients=10, arrival_interval=10, random_seed=42)
-    data = generator.generate_data(num_scenarios=30)
-    # Solve SMILP SAA deterministic equivalent
-    print("Solving SMILP (SAA deterministic equivalent)...")
-    model, sol = build_smilp_model(data, M=500, time_limit=600, verbose=True)
-    print("SMILP Obj:", sol["obj"])
+    # Settings based on paper
+    # "Average hourly arrivals is around 6... 4 hours long" -> ~24 patients
+    # "Optimization sample size N0 = 100"
+    # "Simulation sample N' = 500"
+    
+    NUM_PATIENTS = 10 
+    TRAIN_SCENARIOS = 100 
+    TEST_SCENARIOS = 500
+    
+    TOTAL_SCENARIOS = TRAIN_SCENARIOS + TEST_SCENARIOS
+    print("=== Step 1: Generating Data ===")
+    gen = InstanceGenerator(num_patients=NUM_PATIENTS, arrival_interval=10, random_seed=42)
+    full_data = gen.generate_data(num_scenarios=TOTAL_SCENARIOS)    
+    train_data, test_data = split_data(full_data, TRAIN_SCENARIOS, TEST_SCENARIOS)
 
-    # Solve baseline deterministic and evaluate baseline
-    print("Solving baseline deterministic then evaluating on scenarios...")
-    baseline = build_baseline_mean_model(data, M=500, time_limit=600, verbose=True)
-    print("Baseline v_base (avg over scenarios):", baseline["v_base"])
-    print("Baseline Q per scenario:", baseline["Q_vals"])
-    plot_comparison_boxplot(sol["Q_per_scenario"], baseline["Q_vals"])
+    print("\n=== Step 2: Solving Optimization Models (Training) ===")
+    # 2.1 Solve Baseline
+    sol_baseline = solve_baseline_training(train_data, time_limit=600)
+    
+    # 2.2 Solve SMILP
+    sol_smilp = solve_smilp_training(train_data, time_limit=3600) # SMILP takes longer
 
+    print("\n=== Step 3: Out-of-Sample Evaluation (Testing) ===")
+    # 3.1 Evaluate Baseline Solution on Test Data
+    print("Evaluating Baseline Solution...")
+    q_base = evaluate_solution_on_scenarios(sol_baseline, test_data)
+
+    # 3.2 Evaluate SMILP Solution on Test Data
+    print("Evaluating SMILP Solution...")
+    q_smilp = evaluate_solution_on_scenarios(sol_smilp, test_data)
+
+    print("\n=== Step 4: Comparison & Plotting ===")
+    plot_paper_comparison(q_smilp, q_base)

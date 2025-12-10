@@ -1,42 +1,44 @@
+# instance_generator.py
 import numpy as np
 import random
-
+from copy import deepcopy
 
 class InstanceGenerator:
-    def __init__(self, num_patients=20, arrival_interval=10, random_seed=42):
+    """
+    Produce instances compatible with Two-Stage SMILP:
+    - resources_by_type: mapping type -> list of unit resource dicts {'uid', 'type', 'orig_id'}
+    - activities: list of activities with required_types (list of types), durations per scenario, predecessor, scheduled_start, is_start
+    """
+
+    def __init__(self, num_patients=15, arrival_interval=10, random_seed=42):
         np.random.seed(random_seed)
         random.seed(random_seed)
 
         self.num_patients = num_patients
         self.arrival_interval = arrival_interval
 
-        # ---------------------------------------------------------
-        # 1. Resource definitions (可多資源)
-        # ---------------------------------------------------------
+        # Original resource types with capacity
         self.resources = {
-            "Intake Nurse":     {"capacity": 3, "id": 0},
+            "Nurse":     {"capacity": 3, "id": 0},
             "Radiology Tech":   {"capacity": 1,   "id": 1},
-            "XRay Room":        {"capacity": 1,   "id": 2},
+            # "XRay Room":        {"capacity": 1,   "id": 2},
             "Provider":         {"capacity": 1,   "id": 3},
             "Ortho Tech":       {"capacity": 1,   "id": 4},
-            "Casting Room":     {"capacity": 1,   "id": 5},
-            "Discharge Nurse":  {"capacity": 3, "id": 6},
+            # "Casting Room":     {"capacity": 1,   "id": 5},
         }
 
-        # ---------------------------------------------------------
-        # 2. Activity → multi-resource mapping
-        # ---------------------------------------------------------
+        # Activity mapping to resource types (names must match keys above)
         self.activity_resource_map = {
-            "Intake":               ["Intake Nurse"],
-            "Radiology":            ["Radiology Tech", "XRay Room"],
+            "Intake":               ["Nurse"],
+            # "Radiology":            ["Radiology Tech", "XRay Room"],
+            "Radiology":            ["Radiology Tech"],
             "Provider Visit":       ["Provider"],
-            "Casting Procedure":    ["Ortho Tech", "Casting Room"],
-            "Discharge":            ["Discharge Nurse"],
+            # "Casting Procedure":    ["Ortho Tech", "Casting Room"],
+            "Casting Procedure":    ["Ortho Tech"],
+            "Discharge":            ["Nurse"],
         }
 
-        # ---------------------------------------------------------
-        # 3. RTLS-based dominant pathways
-        # ---------------------------------------------------------
+        # dominant pathways and distribution params (means, variances) - using your table
         self.pathway_data = [
             {
                 "prob": 0.3803,
@@ -76,50 +78,71 @@ class InstanceGenerator:
         mu = np.log(mean) - 0.5 * sigma2
         return mu, sigma
 
+    def _expand_resource_units(self):
+        """
+        Convert self.resources like Nurse(cap=3) into explicit resource units,
+        each unit has capacity 1 and unique uid integer.
+        Returns:
+            resources_by_type: mapping type_name -> list of unit dicts {'uid', 'type', 'orig_id'}
+            resource_uid_to_type: mapping uid -> type_name
+            next_uid: int next free uid
+        """
+        resources_by_type = {}
+        resource_uid_to_type = {}
+        uid = 0
+        for rtype, rinfo in self.resources.items():
+            cap = int(rinfo.get("capacity", 1))
+            units = []
+            for k in range(cap):
+                units.append({"uid": uid, "type": rtype, "orig_id": rinfo.get("id", None)})
+                resource_uid_to_type[uid] = rtype
+                uid += 1
+            resources_by_type[rtype] = units
+        return resources_by_type, resource_uid_to_type
+
     def generate_data(self, num_scenarios=30):
+        """
+        Returns data dict with:
+          - patients
+          - activities: list of dicts with 'id','patient_id','name','required_types' (list), 'durations' (list),
+                        'predecessor', 'is_start','scheduled_start','mean_duration','var_duration'
+          - resources_by_type
+          - resource_uid_to_type
+          - num_scenarios
+        """
+        resources_by_type, resource_uid_to_type = self._expand_resource_units()
+
         patients = []
         activities = []
-
         current_arrival = 0
         activity_global_id = 0
 
         path_probs = np.array([p["prob"] for p in self.pathway_data])
-        path_probs /= path_probs.sum()
+        path_probs = path_probs / path_probs.sum()
 
         for pid in range(self.num_patients):
-
-            # ------------- Pathway selection -------------
+            # sample pathway type
             path_idx = np.random.choice(len(self.pathway_data), p=path_probs)
             pinfo = self.pathway_data[path_idx]
-
             seq = pinfo["sequence"]
             means = pinfo["means"]
-            vars = pinfo["variances"]
+            vars_ = pinfo["variances"]
 
-            patient_act_ids = []
-
-            # ----- arrival -----
+            # arrival spacing
             interval = max(1, np.random.normal(self.arrival_interval, 1.0))
             current_arrival += int(round(interval))
 
             predecessor = None
+            patient_act_ids = []
 
-            # ---------------- Generate activities ----------------
             for i, act_name in enumerate(seq):
-
-                required_res = [
-                    self.resources[r]["id"] for r in self.activity_resource_map[act_name]
-                ]
-
+                # required types
+                req_types = self.activity_resource_map[act_name]
                 mean_d = means[i]
-                var_d = vars[i]
-
+                var_d = vars_[i]
                 mu, sigma = self._convert_params_to_lognormal(mean_d, var_d)
-
-                samples = np.maximum(
-                    1, np.round(np.random.lognormal(mu, sigma, num_scenarios))
-                )
-
+                samples = np.maximum(1, np.round(np.random.lognormal(mu, sigma, num_scenarios)))
+                # samples = np.clip(samples, 1, mean_d + 3*np.sqrt(var_d))
                 act_id = activity_global_id
                 activity_global_id += 1
                 patient_act_ids.append(act_id)
@@ -128,16 +151,14 @@ class InstanceGenerator:
                     "id": act_id,
                     "patient_id": pid,
                     "name": act_name,
-                    "required_resources": required_res,
+                    "required_types": deepcopy(req_types),  # list of type names
                     "durations": samples.tolist(),
-                    "mean_duration": mean_d,
-                    "var_duration": var_d,
-                    "variance": var_d,
+                    "mean_duration": float(mean_d),
+                    "var_duration": float(var_d),
                     "predecessor": predecessor,
-                    "is_start": i == 0,
-                    "scheduled_start": current_arrival if i == 0 else None
+                    "is_start": (i == 0),
+                    "scheduled_start": int(current_arrival) if i == 0 else None
                 })
-
                 predecessor = act_id
 
             patients.append({
@@ -147,9 +168,18 @@ class InstanceGenerator:
                 "arrival_time": current_arrival
             })
 
-        return {
+        data = {
             "patients": patients,
             "activities": activities,
-            "resources": self.resources,
-            "num_scenarios": num_scenarios,
+            "resources_by_type": resources_by_type,
+            "resource_uid_to_type": resource_uid_to_type,
+            "num_scenarios": num_scenarios
         }
+        return data
+
+if __name__ == "__main__":
+    generator = InstanceGenerator(num_patients=2, arrival_interval=10, random_seed=42)
+    data = generator.generate_data(num_scenarios=5)
+    import pprint
+    pp = pprint.PrettyPrinter(indent=2)
+    pp.pprint(data)
