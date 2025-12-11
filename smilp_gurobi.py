@@ -6,7 +6,128 @@ import copy
 import numpy as np
 import matplotlib.pyplot as plt
 # 假設 instance_generator.py 與此檔案在同一目錄
-from instance_generator import InstanceGenerator 
+from instance_generator import InstanceGenerator
+import matplotlib.patches as mpatches
+
+def get_schedule_for_scenario(first_stage_sol, data, k, M=1000, time_limit=60):
+    """
+    對單一情境 k 建 LP（b[a] 為變數），並以 first_stage_sol["x"], sa1, sa2 當常數
+    回傳 schedule: list of dicts [{'activity': a, 'start': s, 'dur': d, 'resource': j}, ...]
+    """
+    idx = build_index_sets(data)
+    A, A_info = idx["A"], idx["A_info"]
+    scenarios = list(range(data["num_scenarios"]))
+    if k not in scenarios:
+        raise ValueError(f"Scenario k={k} not in data (num_scenarios={data['num_scenarios']})")
+    
+    # fixed decisions
+    x_fixed = first_stage_sol["x"]
+    sa1_fixed = first_stage_sol.get("sa1", {})
+    sa2_fixed = first_stage_sol.get("sa2", {})
+
+    # Build small eval model
+    eval_model = Model(f"Gantt_Eval_k{k}")
+    eval_model.setParam('OutputFlag', 0)
+    if time_limit: eval_model.setParam('TimeLimit', time_limit)
+
+    # b variables
+    b = {a: eval_model.addVar(lb=0.0, name=f"b_{a}") for a in A}
+    eval_model.update()
+
+    # durations for this scenario
+    d_k = {a: float(A_info[a]["durations"][k]) for a in A}
+    t_a = {a: (A_info[a]["scheduled_start"] if A_info[a]["is_start"] else None) for a in A}
+    pre = {a: A_info[a]["predecessor"] for a in A}
+
+    # precedence
+    for a in A:
+        if A_info[a]["is_start"]:
+            eval_model.addConstr(b[a] >= t_a[a])
+        else:
+            prev = pre[a]
+            eval_model.addConstr(b[a] >= b[prev] + d_k[prev])
+
+    # sequencing constraints using fixed sa1/sa2
+    for (a,a2), val_sa1 in sa1_fixed.items():
+        val_sa2 = sa2_fixed.get((a,a2), 0)
+        # linearized big-M with constants
+        eval_model.addConstr(M * val_sa1 >= b[a] - b[a2] + 1)
+        eval_model.addConstr(M * (1 - val_sa1) >= b[a2] - b[a])
+        eval_model.addConstr(M * val_sa2 >= b[a2] - b[a] + d_k[a2])
+        eval_model.addConstr(M * (1 - val_sa2) >= b[a] - b[a2] - d_k[a2] + 1)
+
+    # objective: minimize same waiting time metric (not strictly necessary for extracting feasible b,
+    # but keeps solution consistent with evaluation)
+    terms = []
+    for a in A:
+        if A_info[a]["is_start"]:
+            terms.append(b[a] - t_a[a])
+        else:
+            terms.append(b[a] - b[pre[a]] - d_k[pre[a]])
+    eval_model.setObjective(quicksum(terms), GRB.MINIMIZE)
+
+    eval_model.optimize()
+    if eval_model.Status not in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+        raise RuntimeError(f"Schedule extraction infeasible for scenario {k} (status {eval_model.Status})")
+
+    # build schedule list
+    schedule = []
+    for a in A:
+        start = b[a].X
+        dur = d_k[a]
+        # find assigned resource j from x_fixed mapping
+        assigned_j = None
+        for (aa,j), val in x_fixed.items():
+            if aa == a:
+                assigned_j = j
+                break
+        schedule.append({'activity': a, 'start': float(start), 'dur': float(dur), 'resource': assigned_j})
+
+    # sort schedule by start time
+    schedule = sorted(schedule, key=lambda x: x['start'])
+    return schedule
+
+def plot_gantt_schedule(schedule, filename=None, title=None, figsize=(12,6)):
+    """
+    schedule: list of dicts with keys 'activity', 'start', 'dur', 'resource'
+    filename: if provided, save figure to this path
+    """
+    # Group by resource
+    resources = sorted(list({s['resource'] for s in schedule}))
+    resource_to_y = {r: i for i,r in enumerate(resources)}  # 0..R-1
+
+    # Prepare plotting
+    fig, ax = plt.subplots(figsize=figsize)
+    yticks = []
+    yticklabels = []
+    bar_height = 0.6
+
+    # For legend: unique activity colors (matplotlib chooses default colors)
+    patches = []
+
+    for s in schedule:
+        r = s['resource']
+        y = resource_to_y[r]
+        ax.barh(y, s['dur'], left=s['start'], height=bar_height)
+        # annotate activity id on bar
+        ax.text(s['start'] + s['dur']/2, y, str(s['activity']), va='center', ha='center', fontsize=9, color='k')
+        if r not in yticklabels:
+            yticks.append(y)
+            yticklabels.append(str(r))
+
+    ax.set_yticks(list(resource_to_y.values()))
+    ax.set_yticklabels([str(r) for r in resources])
+    ax.set_xlabel("Time (same units as durations)")
+    ax.set_ylabel("Resource (unit id)")
+    ax.set_title(title or "Schedule Gantt Chart")
+    ax.grid(axis='x', linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    if filename:
+        plt.savefig(filename, dpi=200)
+        print(f"Gantt chart saved to {filename}")
+    plt.show()
+
 
 # ==========================================
 # 1. 資料預處理 (Data Preprocessing)
@@ -429,7 +550,7 @@ if __name__ == "__main__":
     # "Optimization sample size N0 = 100"
     # "Simulation sample N' = 500"
     
-    NUM_PATIENTS = 10 
+    NUM_PATIENTS = 15
     TRAIN_SCENARIOS = 100 
     TEST_SCENARIOS = 500
     
@@ -457,3 +578,15 @@ if __name__ == "__main__":
 
     print("\n=== Step 4: Comparison & Plotting ===")
     plot_paper_comparison(q_smilp, q_base)
+
+    scenario_to_plot = 0
+
+    # 以 SMILP 的第一階段解為例
+    schedule = get_schedule_for_scenario(sol_smilp, test_data, k=scenario_to_plot)
+    plot_gantt_schedule(schedule, filename=f"gantt_smilp_k{scenario_to_plot}.png",
+                        title=f"SMILP schedule (scenario {scenario_to_plot})")
+
+    # 也可以畫 baseline 的
+    schedule_base = get_schedule_for_scenario(sol_baseline, test_data, k=scenario_to_plot)
+    plot_gantt_schedule(schedule_base, filename=f"gantt_baseline_k{scenario_to_plot}.png",
+                        title=f"Baseline schedule (scenario {scenario_to_plot})")
