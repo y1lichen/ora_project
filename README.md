@@ -21,3 +21,5 @@
 | 2       | Intake, Ortho Tech, Discharge                   | 13.93%                         | [4.75, 11.82, 3.44]                             | [4.35, 232.7, 3.36]                            |
 | 3       | Intake, Radiology Tech, Ortho Tech, Discharge   | 13.78%                         | [4.91, 3.58, 11.25, 3.49]                       | [3.75, 5.79, 224.31, 3.31]                     |
 | 4       | Intake, Radiology Tech, Provider, Discharge     | 9.71%                          | [5.06, 3.52, 6.15, 3.62]                        | [3.98, 4.95, 30.61, 4.06]                      |
+
+## 

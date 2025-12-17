@@ -510,7 +510,7 @@ if __name__ == "__main__":
     EPSILON_AOIN = 0.05 # AOIN 終止容忍值
     
     # 實驗參數
-    NUM_PATIENTS = 10 
+    NUM_PATIENTS = 15
     BIG_M_VALUE = 10000 # 較大的 M 值以應對 Log-Normal 分佈的高方差
     TIME_LIMIT_SAA = 1200 # 每個 SAA 模型的求解時間限制 (秒)
 
