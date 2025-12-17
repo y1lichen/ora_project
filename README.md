@@ -1,6 +1,6 @@
 # Multi-Resource Allocation and Care Sequence Optimization (SMILP)
 
-本專案實作了一篇關於門診醫療資源配置與排程優化的學術論文演算法。核心目標是在醫療資源（人力、設備）受限且病患活動工期具有不確定性的情況下，透過兩階段隨機混合整數線性規劃 (Two-stage SMILP) 模型，極小化病患的總體等待時間。
+本專案實作了 [Multi-resource allocation and care sequence assignment in patient management: a stochastic programming approach. Health Care Management Science](https://link.springer.com/article/10.1007/s10729-024-09675-6)。核心目標是在醫療資源（人力、設備）受限且病患活動工期具有不確定性的情況下，透過兩階段隨機混合整數線性規劃 (Two-stage SMILP) 模型，極小化病患的總體等待時間。
 
 ## 論文背景
 在高粒度的門診環境中，病患的照護流程（Care Pathways）涉及多種資源分配。傳統的「確定性模型」無法應對工期波動，導致排程效果不佳。本研究提出：
