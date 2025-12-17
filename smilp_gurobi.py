@@ -551,7 +551,7 @@ if __name__ == "__main__":
     # "Simulation sample N' = 500"
     
     NUM_PATIENTS = 15
-    TRAIN_SCENARIOS = 100 
+    TRAIN_SCENARIOS = 50 
     TEST_SCENARIOS = 500
     
     TOTAL_SCENARIOS = TRAIN_SCENARIOS + TEST_SCENARIOS

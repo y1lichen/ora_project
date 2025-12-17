@@ -1,66 +1,96 @@
-# Multi-Resource Allocation and Care Sequence Optimization (SMILP)
+# Multi-Resource Allocation and Care Sequence Optimization (Two-Stage SMILP)
 
-本專案實作了 [Multi-resource allocation and care sequence assignment in patient management: a stochastic programming approach. Health Care Management Science](https://link.springer.com/article/10.1007/s10729-024-09675-6)。核心目標是在醫療資源（人力、設備）受限且病患活動工期具有不確定性的情況下，透過兩階段隨機混合整數線性規劃 (Two-stage SMILP) 模型，極小化病患的總體等待時間。
+This project implements the model proposed in  
+**Yao et al. (2024), _Multi-resource allocation and care sequence assignment in patient management: A stochastic programming approach_, Health Care Management Science**.  
+(https://link.springer.com/article/10.1007/s10729-024-09675-6)
 
-## 論文背景
-在高粒度的門診環境中，病患的照護流程（Care Pathways）涉及多種資源分配。傳統的「確定性模型」無法應對工期波動，導致排程效果不佳。本研究提出：
-
-* 第一階段決策 (Planning)：在觀察到實際工期前，決定資源分配 (x) 與活動先後順序 (s1​,s2​)。
-
-* 第二階段決策 (Recourse)：根據實際發生的工期，決定各活動的開始時間 (b)。
-
-* 方法論：結合樣本平均近似法 (SAA) 與 蒙地卡羅優化 (MCO)，自動尋找兼顧精確度與運算效率的最佳樣本數量。
-
-## 資料集
-論文使用的原始資料集是使用 Real-Time Location System(RTLS) 取得病患在骨科診所的位置資料，推估病患在診療流程中各個活動的時長。由於論文並未提供資料集，故本專案依論文提供的統計分佈生成數據，生成數據的程式碼為 [instance_generator.py](./instance_generator.py)，
-
-| Path ID | Activity List                                   | Resource Interaction Probability | Mean (minutes)                                   | Variance                                         |
-|---------|-------------------------------------------------|---------------------------------|-------------------------------------------------|-------------------------------------------------|
-| 0       | Intake, Radiology Tech, Provider, Ortho Tech, Discharge | 38.03%                         | [4.7, 3.48, 4.52, 11.62, 3.43]                  | [3.25, 4.85, 13.9, 185.52, 2.63]               |
-| 1       | Intake, Provider, Ortho Tech, Discharge         | 24.55%                         | [4.93, 4.99, 12.47, 3.69]                       | [4.0, 20.11, 206.96, 2.92]                     |
-| 2       | Intake, Ortho Tech, Discharge                   | 13.93%                         | [4.75, 11.82, 3.44]                             | [4.35, 232.7, 3.36]                            |
-| 3       | Intake, Radiology Tech, Ortho Tech, Discharge   | 13.78%                         | [4.91, 3.58, 11.25, 3.49]                       | [3.75, 5.79, 224.31, 3.31]                     |
-| 4       | Intake, Radiology Tech, Provider, Discharge     | 9.71%                          | [5.06, 3.52, 6.15, 3.62]                        | [3.98, 4.95, 30.61, 4.06]                      |
-
-## Model Overview: Two-Stage SMILP for Healthcare Resource Allocation
- 
-The model is designed for clinic or outpatient settings where patients follow predefined care pathways consisting of multiple sequential activities that compete for shared, capacity-limited resources.
+The core objective is to **minimize total patient waiting time** in healthcare systems with **limited medical resources** (personnel and equipment) and **uncertain activity durations**, using a **two-stage stochastic mixed-integer linear programming (SMILP)** formulation.
 
 ---
 
-## 1. Problem Overview
+## Background and Motivation
+
+In high-granularity outpatient clinic settings, patient care pathways consist of multiple sequential activities that compete for shared medical resources. Traditional **deterministic scheduling models** fail to capture the variability in service durations, often leading to inefficient schedules and excessive patient waiting.
+
+This work addresses these challenges by proposing:
+
+- **First-stage (planning) decisions**:  
+  Resource assignment (`x`) and activity sequencing (`s1`, `s2`) are determined **before** actual service durations are observed.
+
+- **Second-stage (recourse) decisions**:  
+  Activity start times (`b`) are determined **after** service durations are realized.
+
+- **Solution methodology**:  
+  A combination of **Sample Average Approximation (SAA)** and **Monte Carlo Optimization (MCO)** is used to automatically balance solution accuracy and computational efficiency by selecting an appropriate number of duration scenarios.
+
+---
+
+## Dataset and Data Generation
+
+The original paper uses patient trajectory data collected via a **Real-Time Location System (RTLS)** in an orthopedic clinic to estimate activity durations along care pathways.
+
+Since the original dataset is not publicly available, this project **synthetically generates data** based on the statistical distributions reported in the paper.  
+The data generation code is provided in:
+
+```
+
+instance_generator.py
+
+```
+
+### Care Pathway Distributions
+
+| Path ID | Activity Sequence                                   | Probability | Mean Duration (min)                      | Variance                                   |
+|--------:|-----------------------------------------------------|-------------|-------------------------------------------|--------------------------------------------|
+| 0 | Intake → Radiology Tech → Provider → Ortho Tech → Discharge | 38.03% | [4.7, 3.48, 4.52, 11.62, 3.43] | [3.25, 4.85, 13.9, 185.52, 2.63] |
+| 1 | Intake → Provider → Ortho Tech → Discharge | 24.55% | [4.93, 4.99, 12.47, 3.69] | [4.0, 20.11, 206.96, 2.92] |
+| 2 | Intake → Ortho Tech → Discharge | 13.93% | [4.75, 11.82, 3.44] | [4.35, 232.7, 3.36] |
+| 3 | Intake → Radiology Tech → Ortho Tech → Discharge | 13.78% | [4.91, 3.58, 11.25, 3.49] | [3.75, 5.79, 224.31, 3.31] |
+| 4 | Intake → Radiology Tech → Provider → Discharge | 9.71% | [5.06, 3.52, 6.15, 3.62] | [3.98, 4.95, 30.61, 4.06] |
+
+---
+
+## Model Overview: Two-Stage SMILP
+
+The model is designed for outpatient or clinic environments where patients follow **predefined care pathways** consisting of sequential activities that compete for **shared, capacity-limited resources**.
+
+---
+
+## 1. Problem Description
 
 We consider a healthcare system with:
 
-- **Patients** who require a sequence of medical activities (e.g., consultation → exam → treatment)
-- **Multiple resource types** (e.g., physicians, nurses, rooms, equipment)
+- **Patients** requiring a sequence of medical activities  
+  (e.g., consultation → exam → treatment)
+- **Multiple resource types**  
+  (e.g., physicians, nurses, rooms, equipment)
 - **Uncertain activity durations**, modeled as random variables
-- **Pre-scheduled appointment times** for each patient
+- **Pre-scheduled appointment times**
 
 The goal is to:
 
-> **Assign resources and determine activity sequences in advance, such that the expected total patient waiting time is minimized**, while respecting resource capacities and precedence constraints.
+> **Assign resources and determine activity sequences in advance such that the expected total patient waiting time is minimized**, while respecting resource capacities and activity precedence constraints.
 
-This problem is challenging because:
-- Resource assignment decisions must be made **before** service durations are realized.
-- Activity start times depend on **realized durations** and therefore must be decided **after** uncertainty is revealed.
+The main challenge arises because:
+- Resource assignment and sequencing decisions must be made **before** service durations are known.
+- Actual activity start times depend on **realized durations** and must be determined **after** uncertainty is revealed.
 
 ---
 
 ## 2. Model Structure
 
-The model is formulated as a **two-stage stochastic program with recourse**:
+The problem is formulated as a **two-stage stochastic program with recourse**.
 
-### Stage 1 (Planning Decisions – Before Uncertainty)
+### Stage 1: Planning Decisions (Before Uncertainty)
 - Assign activities to specific resources
-- Decide relative sequencing between activities that share resource types
-- Enforce resource capacity feasibility
+- Decide relative sequencing between activities sharing the same resource type
+- Enforce feasibility with respect to resource capacities
 
-### Stage 2 (Operational Decisions – After Uncertainty)
+### Stage 2: Operational Decisions (After Uncertainty)
 - Determine actual activity start times
-- Compute realized patient waiting times for each scenario
+- Compute realized patient waiting times for each duration scenario
 
-The objective is to **minimize expected total waiting time** across all patients.
+The objective is to **minimize the expected total waiting time** across all patients.
 
 ---
 
@@ -74,7 +104,7 @@ The objective is to **minimize expected total waiting time** across all patients
 | `A1` | Set of subsequent activities |
 | `J` | Set of individual resources |
 | `G` | Set of resource types |
-| `Jg` | Resources of type `g` |
+| `Jg` | Resources belonging to type `g` |
 | `A(g)` | Activities requiring resource type `g` |
 
 ---
@@ -83,13 +113,13 @@ The objective is to **minimize expected total waiting time** across all patients
 
 | Parameter | Description |
 |----------|-------------|
-| `ta` | Scheduled appointment time for initial activity `a ∈ A0` |
-| `da` | Random duration of activity `a` |
-| `Va,g` | Number of type-`g` resources required by activity `a` |
-| `kj` | Capacity of resource `j` |
+| `t_a` | Scheduled appointment time for initial activity `a ∈ A0` |
+| `d_a` | Random duration of activity `a` |
+| `V_{a,g}` | Number of type-`g` resources required by activity `a` |
+| `k_j` | Capacity of resource `j` |
 | `u` | Planning horizon |
 
-Activity durations `da` are **random variables** with known distributions estimated from historical data.
+Activity durations are random variables with known distributions estimated from historical data.
 
 ---
 
@@ -99,146 +129,137 @@ Activity durations `da` are **random variables** with known distributions estima
 
 | Variable | Type | Description |
 |--------|------|-------------|
-| `xᵃⱼ` | Binary | 1 if resource `j` is assigned to activity `a` |
-| `s¹ₐ,ₐ′` | Binary | 1 if activity `a` is not scheduled before `a′` |
-| `s²ₐ,ₐ′` | Binary | 1 if activity `a` starts before `a′` ends |
-| `qⱼₐ,ₐ′` | Binary | 1 if activity `a′` is ongoing when `a` starts and both use resource `j` |
+| `x_{a,j}` | Binary | 1 if resource `j` is assigned to activity `a` |
+| `s1_{a,a'}` | Binary | 1 if activity `a` is not scheduled before `a'` |
+| `s2_{a,a'}` | Binary | 1 if activity `a` starts before activity `a'` ends |
+| `q_{j,a,a'}` | Binary | 1 if activity `a'` is ongoing when `a` starts and both use resource `j` |
 
 ### Second-Stage Variables (Scenario-Dependent)
 
 | Variable | Type | Description |
 |--------|------|-------------|
-| `bᵃ` | Continuous | Start time of activity `a` |
+| `b_a` | Continuous | Start time of activity `a` |
 
 ---
 
 ## 6. Objective Function
 
-### Expected Waiting Time Minimization
-
 The objective minimizes:
-- Waiting after scheduled appointment time (initial activities)
-- Waiting between consecutive activities along a patient's pathway
 
-Formally:
+- Waiting time after scheduled appointment times (initial activities)
+- Waiting time between consecutive activities along each patient pathway
 
-- **Stage 1**:  
-  \[
-  \min \mathbb{E}_\xi[Q(x, s_1, s_2, q, \xi)]
-  \]
+Conceptually:
 
-- **Stage 2 (per scenario)**:  
-  Sum of waiting times induced by realized durations
+- **Stage 1** minimizes the expected second-stage waiting cost.
+- **Stage 2** computes realized waiting times for each duration scenario.
 
 ---
 
 ## 7. Constraints
 
 ### 7.1 Resource Assignment Constraints
-Ensure that each activity receives the required number of resources of each type:
 
-\[
-\sum_{j \in J_g} x^a_j = V_{a,g}
-\]
+Each activity must receive the required number of resources of each type:
+
+```
+
+sum_{j in J_g} x_{a,j} = V_{a,g}
+
+```
 
 ---
 
 ### 7.2 Capacity Constraints (Key Innovation)
 
-Instead of time-indexed formulations, **capacity is enforced only at activity start times**.
+Unlike traditional time-indexed formulations, **capacity is enforced only at activity start times**.
 
-- `qⱼₐ,ₐ′` identifies whether activity `a′` overlaps with `a` on resource `j`
-- The number of overlapping activities must not exceed resource capacity:
+- `q_{j,a,a'}` indicates whether activity `a'` overlaps with activity `a` on resource `j`
+- The total number of overlapping activities cannot exceed the capacity of the resource:
 
-\[
-\sum_{a' \neq a} q^j_{a,a'} \le k_j - 1
-\]
+```
 
-This dramatically reduces model size and complexity.
+sum_{a' != a} q_{j,a,a'} <= k_j - 1
+
+```
+
+This significantly reduces model size and computational complexity.
 
 ---
 
 ### 7.3 Logical Linking Constraints
 
 Big-M constraints link:
+
 - Resource assignments (`x`)
-- Sequencing decisions (`s₁`, `s₂`)
+- Sequencing decisions (`s1`, `s2`)
 - Overlap indicators (`q`)
 
-These ensure `qⱼₐ,ₐ′ = 1` **if and only if**:
+They ensure that `q_{j,a,a'} = 1` **if and only if**:
+
 - Both activities use resource `j`
-- `a′` has started
-- `a′` has not yet finished when `a` starts
+- Activity `a'` has started
+- Activity `a'` has not finished when activity `a` starts
 
 ---
 
 ### 7.4 Precedence Constraints (Second Stage)
 
-- Initial activities cannot start before appointment time
-- Subsequent activities cannot start before their predecessors finish
+Precedence is enforced as follows:
 
-\[
-b_a \ge t_a \quad (a \in A_0)
-\]
-\[
-b_a \ge b_{\text{pre}(a)} + d_{\text{pre}(a)} \quad (a \in A_1)
-\]
+- Initial activities cannot start before their scheduled appointment times:
+```
+
+b_a >= t_a, for a in A0
+
+```
+
+- Subsequent activities cannot start before their predecessor finishes:
+```
+
+b_a >= b_pre(a) + d_pre(a), for a in A1
+
+```
+
+These constraints are scenario-dependent due to random durations.
 
 ---
 
 ### 7.5 Sequencing Constraints
 
-Big-M constraints enforce relative ordering between activities that share resource types, ensuring consistency with `s₁` and `s₂`.
+Big-M constraints enforce consistency between activity start times and the first-stage sequencing decisions (`s1`, `s2`) for activities sharing resource types.
 
 ---
 
 ## 8. Monte Carlo Optimization (MCO) with SAA
 
-Directly solving the SMILP is intractable due to the expectation over continuous distributions.
+Solving the full SMILP directly is computationally intractable due to the expectation over continuous random variables.
 
 ### Solution Approach
 
-1. **Sample Average Approximation (SAA)**
-   - Replace expectation with an average over `N` sampled duration scenarios
+1. **Sample Average Approximation (SAA)**  
+   - Replace the expectation with an average over `N` sampled duration scenarios  
    - Results in a deterministic MILP
 
-2. **Monte Carlo Optimization (MCO)**
+2. **Monte Carlo Optimization (MCO)**  
    - Iteratively increase sample size `N`
-   - Estimate lower and upper bounds via optimization + simulation
-   - Terminate when the **Approximate Optimality Index (AOI)** is below tolerance `ε`
+   - Estimate statistical lower and upper bounds via optimization and simulation
+   - Terminate when the **Approximate Optimality Index (AOI)** falls below tolerance `ε`
 
-\[
-AOI_N = \frac{|\bar{v}_{N'} - \bar{v}_N|}{\bar{v}_{N'}}
-\]
+```
 
-This balances **solution quality** and **computational tractability**.
+AOI_N = |v̄_N' - v̄_N| / v̄_N'
 
----
+```
 
-## 9. Key Innovations
-
-### 1. Start-Time-Based Capacity Enforcement
-- Avoids traditional time-indexed formulations
-- Capacity is checked **only at activity start times**
-- Significantly reduces binary variables and constraints
-
-### 2. Explicit Modeling of Activity Overlaps
-- Novel use of `s₁`, `s₂`, and `q` variables
-- Precisely captures partial overlaps between activities sharing resources
-
-### 3. True Two-Stage Healthcare Planning Model
-- Reflects real-world operations:
-  - Assign staff/resources **before** service day
-  - Adjust start times **after** uncertainty is realized
-
-### 4. Integrated Optimization–Simulation Framework
-- MCO + SAA provides statistical guarantees
-- Produces near-optimal solutions with controllable accuracy
+This procedure balances **solution accuracy** and **computational efficiency**.
 
 ---
 
-## 10. Applicability
+## Applicability
 
-This framework is suitable for any service system with shared, capacity-limited resources and uncertain service times
+This framework applies to healthcare and service systems with:
 
----
+- Sequential tasks
+- Shared, capacity-limited resources
+- Uncertain service durations

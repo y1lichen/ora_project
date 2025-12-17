@@ -355,9 +355,9 @@ def solve_baseline_training(data, M=20000, time_limit=600):
     model.optimize()
 
     sol_first_stage = {
-        "x": {(a,j): round(var.X) for (a,j), var in x.items() if var.X > 0.5},
-        "sa1": {(a,a2): round(var.X) for (a,a2) in sa1 if sa1[(a,a2)].X > 0.5},
-        "sa2": {(a,a2): round(var.X) for (a,a2) in sa2 if sa2[(a,a2)].X > 0.5},
+    "x": {(a,j): round(var.X) for (a,j), var in x.items() if var.X > 0.5},
+    "sa1": {(a,a2): round(sa1[(a,a2)].X) for (a,a2) in sa1 if sa1[(a,a2)].X > 0.5},
+    "sa2": {(a,a2): round(sa2[(a,a2)].X) for (a,a2) in sa2 if sa2[(a,a2)].X > 0.5},
     }
     return sol_first_stage
 
@@ -505,7 +505,7 @@ def split_data(full_data, n_train, n_test):
 if __name__ == "__main__":
     # Settings based on paper (Algorithm 1)
     N0_INITIAL = 30 # 初始 SAA 樣本量 (為測試 MCO，設小一點)
-    K_REPLICATES = 5 # MCO 迭代次數 K
+    K_REPLICATES = 3 # MCO 迭代次數 K
     N_PRIME_EVAL = 500 # 評估樣本量 N' (為測試 MCO，設小一點)
     EPSILON_AOIN = 0.05 # AOIN 終止容忍值
     
