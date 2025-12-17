@@ -88,7 +88,7 @@ def solve_saa_model(data, M=20000, time_limit=3600, verbose=False, get_b_sol=Fal
     # Model
     model = Model(f"SAA_N{num_scenarios}")
     model.setParam('TimeLimit', time_limit)
-    if not verbose: model.setParam('OutputFlag', 0)
+    # if not verbose: model.setParam('OutputFlag', 0)
     
     # --- Stage 1 Variables (x, sa1, sa2, q) ---
     x = { (a,j): model.addVar(vtype=GRB.BINARY, name=f"x_{a}_{j}") 
@@ -380,7 +380,7 @@ def evaluate_solution_on_scenarios(first_stage_sol, test_data, M=20000, penalty_
     
     for k in scenarios:
         eval_model = Model(f"Eval_k{k}")
-        eval_model.setParam('OutputFlag', 0)
+        # eval_model.setParam('OutputFlag', 0)
         
         b = {a: eval_model.addVar(lb=0.0) for a in A}
         # 鬆弛變數 r[a] 用於解決前置約束 (2c) 的不可行問題
