@@ -282,7 +282,13 @@ def evaluate_solution_on_scenarios_paper_style(sol, data, M=50000, slack_penalty
         )
 
         m.optimize()
-        Q_vals.append(m.ObjVal)
+
+        if m.Status == GRB.OPTIMAL:
+            Q_vals.append(m.ObjVal)
+        else:
+            # paper-style: infeasible or no incumbent → penalize
+            Q_vals.append(SLACK_PENALTY)
+
 
     return np.mean(Q_vals)
 
