@@ -276,6 +276,8 @@ The baseline model uses a generated scenario as the expected value for duration.
 
 This figure shows the Gantt chart of the resources in one scenario of SMILP result.  
 It is clear that the same activity can require multiple resources at the a time.
+## Comment
+The solution time for the SMILP model is longer. Through experiments, it was found that the SMILP model only outperforms the baseline when there is a significant shortage of resources or when the activity duration varies greatly. Therefore, we believe that using SMILP is only necessary in these special circumstances.
 
 ---
 ## Reference
