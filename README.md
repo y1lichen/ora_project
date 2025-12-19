@@ -265,3 +265,18 @@ This framework applies to healthcare and service systems with:
 - Uncertain service durations
 
 ## Experiment Results
+
+<img width="900" height="600" alt="smilp_paper_result" src="https://github.com/user-attachments/assets/927ff3bc-3287-4bbe-9f96-e97294cd5f10" />
+  
+In our experiment, we set 100 scenarios for MCO for only 3 iteration, due to the computation resource limit, the waiting time can improve 10% comparing with the baseline.  
+The baseline model uses a generated scenario as the expected value for duration.
+
+
+<img width="1346" height="673" alt="圖片" src="https://github.com/user-attachments/assets/afc32e62-31a6-4d30-bfe1-6b6fcf46b250" />
+
+This figure shows the Gantt chart of the resources in one scenario of SMILP result.  
+It is clear that the same activity can require multiple resources at the a time.
+
+---
+## Reference
+<https://github.com/y1lichen/ora_project>
